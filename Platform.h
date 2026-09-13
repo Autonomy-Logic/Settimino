@@ -129,13 +129,18 @@
 
 #endif
 
-// SPI is what the classic W5x00 shields ride on. The boards with a MAC of
-// their own do not need it, and on a core without an SPI library -- which
-// a wired-Ethernet MCU may well be -- including it unconditionally is a
-// compile error rather than a missing feature.
-#if !defined(S7_NO_SPI)
-  #include <SPI.h>
-#endif
+// <SPI.h> is NOT included here.
+//
+// Only two boards in this file drive SPI directly -- ESP32_S3_ETH and
+// M5STACK_LAN, both in EthernetInit() -- and each now includes it in its own
+// branch below. Every other board reaches the bus, if at all, through its
+// Ethernet or WiFi library, which includes what it needs itself.
+//
+// Including it unconditionally was not merely redundant, it was a build
+// failure: a wired-Ethernet MCU with an on-chip MAC may ship an <SPI.h> that
+// `#error`s on a board with no SPI bus wired out. The TI Tiva cores are one
+// such case ("LauncPad not supported"), so on those the library could not be
+// compiled at all -- for a header it never used.
 
 // Platforms 
 
@@ -166,6 +171,7 @@
 #ifdef M5STACK_LAN
   #include <M5Stack.h>
   #include <Ethernet2.h>
+  #include <SPI.h>   // EthernetInit() calls SPI.begin() for the LAN module
   #define S7WIRED
 #endif
 
@@ -181,6 +187,7 @@
 
 #ifdef ESP32_S3_ETH
   #include <ETH.h>
+  #include <SPI.h>   // EthernetInit() drives the PHY's SPI pins directly
 
   #ifndef ETH_PHY_CS
   #define ETH_PHY_TYPE ETH_PHY_W5500
