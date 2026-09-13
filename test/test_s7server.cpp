@@ -173,17 +173,17 @@ static void test_unimplemented_is_answered()
     srv.handle(s, CR, sizeof(CR), resp, sizeof(resp), &n);
     srv.handle(s, SETUP, sizeof(SETUP), resp, sizeof(resp), &n);
 
-    // A minimal Read Var job. Until Phase 1 this is not served, but the client
-    // must learn that from an answer, not from a timeout.
-    uint8_t read[] = {
-        0x03, 0x00, 0x00, 0x1F,
+    // Function 0x28 is PLC Control (start/stop), which this server does not
+    // serve. A client must learn that from an ANSWER, not from a timeout: an
+    // error names the problem, a timeout gets reported as "the device is dead".
+    uint8_t ctrl[] = {
+        0x03, 0x00, 0x00, 0x13,
         0x02, 0xF0, 0x80,
-        0x32, 0x01, 0x00, 0x00, 0x05, 0x00, 0x00, 0x0E, 0x00, 0x00,
-        0x04, 0x01,
-        0x12, 0x0A, 0x10, 0x02, 0x00, 0x01, 0x00, 0x00, 0x83, 0x00, 0x00, 0x00
+        0x32, 0x01, 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0x00, 0x00,
+        0x28, 0x00
     };
 
-    int r = srv.handle(s, read, sizeof(read), resp, sizeof(resp), &n);
+    int r = srv.handle(s, ctrl, sizeof(ctrl), resp, sizeof(resp), &n);
     CHECK(r == S7SRV_REPLY, "an unserved function must still get an answer, got %d", r);
     CHECK(resp[8] == 0x03, "the answer is an AckData");
     CHECK(resp[17] == 0x81 && resp[18] == 0x04,
@@ -285,6 +285,363 @@ static void test_counters()
 }
 
 //-----------------------------------------------------------------------------
+// Read Var / Write Var
+//-----------------------------------------------------------------------------
+
+static uint8_t g_db1[64];
+static uint8_t g_mk[32];
+static bool    g_cbReadCalled = false;
+
+static bool cbRead(void* ctx, uint8_t area, uint16_t db, uint32_t start,
+                   uint16_t len, uint8_t* dest)
+{
+    (void)ctx; (void)area; (void)db;
+    g_cbReadCalled = true;
+    if (start + len > sizeof(g_mk)) return false;
+    memcpy(dest, g_mk + start, len);
+    return true;
+}
+
+static bool cbWrite(void* ctx, uint8_t area, uint16_t db, uint32_t start,
+                    uint16_t len, const uint8_t* src)
+{
+    (void)ctx; (void)area; (void)db;
+    if (start + len > sizeof(g_mk)) return false;
+    memcpy(g_mk + start, src, len);
+    return true;
+}
+
+static const S7SrvArea AREAS[] = {
+    { S7AreaDB, 1, g_db1, (uint16_t)sizeof(g_db1), false },
+    { S7AreaMK, 0, NULL,  (uint16_t)sizeof(g_mk),  false },
+    { S7AreaPE, 0, g_db1, 8,                       true  },   // read-only
+};
+
+/** Build a Read Var request for one item. */
+static uint16_t buildRead(uint8_t* buf, uint8_t transport, uint16_t count,
+                          uint16_t db, uint8_t area, uint32_t bitAddr)
+{
+    uint8_t* p = buf;
+    *p++ = 0x03; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;       // TPKT, filled below
+    *p++ = 0x02; *p++ = 0xF0; *p++ = 0x80;                    // COTP DT
+    *p++ = 0x32; *p++ = 0x01;                                 // S7 job
+    *p++ = 0x00; *p++ = 0x00;                                 // redundancy
+    *p++ = 0x00; *p++ = 0x05;                                 // sequence
+    *p++ = 0x00; *p++ = 14;                                   // param len
+    *p++ = 0x00; *p++ = 0x00;                                 // data len
+    *p++ = 0x04; *p++ = 0x01;                                 // Read Var, 1 item
+    *p++ = 0x12; *p++ = 0x0A; *p++ = 0x10; *p++ = transport;
+    *p++ = (uint8_t)(count >> 8); *p++ = (uint8_t)count;
+    *p++ = (uint8_t)(db >> 8);    *p++ = (uint8_t)db;
+    *p++ = area;
+    *p++ = (uint8_t)(bitAddr >> 16); *p++ = (uint8_t)(bitAddr >> 8); *p++ = (uint8_t)bitAddr;
+    const uint16_t total = (uint16_t)(p - buf);
+    buf[2] = (uint8_t)(total >> 8); buf[3] = (uint8_t)total;
+    return total;
+}
+
+/** Build a Write Var request for one item. */
+static uint16_t buildWrite(uint8_t* buf, uint8_t transport, uint16_t count,
+                           uint16_t db, uint8_t area, uint32_t bitAddr,
+                           uint8_t resTs, uint16_t declaredLen,
+                           const uint8_t* value, uint16_t valueLen)
+{
+    uint8_t* p = buf;
+    *p++ = 0x03; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x02; *p++ = 0xF0; *p++ = 0x80;
+    *p++ = 0x32; *p++ = 0x01;
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x00; *p++ = 0x06;
+    *p++ = 0x00; *p++ = 14;
+    *p++ = (uint8_t)((4 + valueLen) >> 8); *p++ = (uint8_t)(4 + valueLen);
+    *p++ = 0x05; *p++ = 0x01;
+    *p++ = 0x12; *p++ = 0x0A; *p++ = 0x10; *p++ = transport;
+    *p++ = (uint8_t)(count >> 8); *p++ = (uint8_t)count;
+    *p++ = (uint8_t)(db >> 8);    *p++ = (uint8_t)db;
+    *p++ = area;
+    *p++ = (uint8_t)(bitAddr >> 16); *p++ = (uint8_t)(bitAddr >> 8); *p++ = (uint8_t)bitAddr;
+    *p++ = 0x00; *p++ = resTs;
+    *p++ = (uint8_t)(declaredLen >> 8); *p++ = (uint8_t)declaredLen;
+    memcpy(p, value, valueLen); p += valueLen;
+    const uint16_t total = (uint16_t)(p - buf);
+    buf[2] = (uint8_t)(total >> 8); buf[3] = (uint8_t)total;
+    return total;
+}
+
+/** Bring a server up to the point where it will serve reads and writes. */
+static void ready(S7Server& srv, S7SrvSession& s, uint8_t* resp, uint16_t cap)
+{
+    srv.setAreas(AREAS, 3);
+    srv.setAccessors(cbRead, cbWrite, NULL);
+    srv.setMaxPduSize(480);
+    srv.beginSession(s);
+    uint16_t n = 0;
+    srv.handle(s, CR, sizeof(CR), resp, cap, &n);
+    srv.handle(s, SETUP, sizeof(SETUP), resp, cap, &n);
+}
+
+static void reset_areas()
+{
+    for (size_t i = 0; i < sizeof(g_db1); i++) g_db1[i] = (uint8_t)i;
+    for (size_t i = 0; i < sizeof(g_mk);  i++) g_mk[i]  = (uint8_t)(0xA0 + i);
+    g_cbReadCalled = false;
+}
+
+static void test_read()
+{
+    printf("Read Var\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+
+    // Four bytes of DB1 from offset 8.
+    uint8_t req[64];
+    uint16_t len = buildRead(req, S7WLByte, 4, 1, S7AreaDB, 8 * 8);
+    int r = srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(r == S7SRV_REPLY, "a read must be answered");
+
+    const uint8_t* item = resp + 7 + 12 + 2;
+    CHECK(item[0] == 0xFF, "return code should be 0xFF, got %02X", item[0]);
+    CHECK(item[1] == 0x04, "transport should be TS_ResByte, got %02X", item[1]);
+    // BITS for byte reads: four bytes is 32.
+    CHECK(((item[2] << 8) | item[3]) == 32, "byte length must be in BITS, got %d",
+          (item[2] << 8) | item[3]);
+    CHECK(memcmp(item + 4, g_db1 + 8, 4) == 0, "wrong bytes came back");
+
+    // A callback-backed area goes through the accessor, not a buffer.
+    len = buildRead(req, S7WLByte, 2, 0, S7AreaMK, 0);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(g_cbReadCalled, "a NULL-data area must be served by the read callback");
+    CHECK(item[0] == 0xFF && item[4] == 0xA0 && item[5] == 0xA1,
+          "callback data did not arrive intact");
+}
+
+static void test_read_bit()
+{
+    printf("Read Var — single bit\n");
+    reset_areas();
+    g_db1[1] = 0x01;   // bit 0 set, 1..7 clear
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+
+    for (uint8_t bit = 0; bit < 8; bit++)
+    {
+        uint8_t req[64];
+        const uint16_t len = buildRead(req, S7WLBit, 1, 1, S7AreaDB, 8 + bit);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+
+        const uint8_t* item = resp + 7 + 12 + 2;
+        CHECK(item[0] == 0xFF, "bit %u: return code %02X", bit, item[0]);
+        CHECK(item[1] == 0x03, "bit %u: transport %02X, expected TS_ResBit", bit, item[1]);
+        // 1, not 8. See the note in funRead(): sending 8 would make Snap7's C
+        // client memcpy eight bytes into the one byte it allocated.
+        CHECK(((item[2] << 8) | item[3]) == 1, "bit %u: length %d, expected 1",
+              bit, (item[2] << 8) | item[3]);
+        CHECK(item[4] == (bit == 0 ? 1 : 0),
+              "bit %u of 0x01 read back as %u", bit, item[4]);
+    }
+}
+
+static void test_read_refusals()
+{
+    printf("Read Var — what it refuses\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+
+    uint8_t req[64];
+    const uint8_t* item = resp + 7 + 12 + 2;
+
+    // Past the end of the area.
+    uint16_t len = buildRead(req, S7WLByte, 8, 1, S7AreaDB, 60 * 8);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(item[0] == 0x05, "out of range should be 0x05, got %02X", item[0]);
+    // A failed item still declares a length; clients parse it.
+    CHECK(((item[2] << 8) | item[3]) == 4, "a failed item should declare length 4");
+
+    // A DB that was never registered.
+    len = buildRead(req, S7WLByte, 2, 99, S7AreaDB, 0);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(item[0] == 0x0A, "missing area should be 0x0A, got %02X", item[0]);
+
+    // A transport size that is not one.
+    len = buildRead(req, 0x77, 1, 1, S7AreaDB, 0);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(item[0] == 0x06, "bad transport should be 0x06, got %02X", item[0]);
+
+    // A word read from an address that is not byte-aligned.
+    len = buildRead(req, S7WLWord, 1, 1, S7AreaDB, 3);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(item[0] == 0x05, "unaligned word read should be 0x05, got %02X", item[0]);
+
+    // The whole request still succeeded; only the item failed.
+    CHECK(resp[17] == 0x00 && resp[18] == 0x00,
+          "the header error must stay 0 -- a failed ITEM is not a failed REQUEST");
+}
+
+static void test_write()
+{
+    printf("Write Var\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+
+    uint8_t req[64];
+    const uint8_t payload[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+    uint16_t len = buildWrite(req, S7WLByte, 4, 1, S7AreaDB, 16 * 8,
+                              0x04, 32, payload, 4);
+    int r = srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(r == S7SRV_REPLY, "a write must be answered");
+    CHECK(resp[7 + 12 + 2] == 0xFF, "write should succeed, got %02X", resp[7 + 12 + 2]);
+    CHECK(memcmp(g_db1 + 16, payload, 4) == 0, "the bytes did not land");
+
+    // The callback path.
+    const uint8_t two[2] = { 0x11, 0x22 };
+    len = buildWrite(req, S7WLByte, 2, 0, S7AreaMK, 4 * 8, 0x04, 16, two, 2);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(g_mk[4] == 0x11 && g_mk[5] == 0x22, "callback write did not land");
+}
+
+static void test_write_bit_both_conventions()
+{
+    printf("Write Var — a bit, from either client convention\n");
+
+    // Snap7 1.4.3 declares a bit's length as 1; python-snap7 3.1.2 declares 8.
+    // A bit is one byte on the wire either way, and the spec already pinned
+    // the size, so both must be accepted -- refusing one would mean refusing
+    // whichever client we happened not to test against.
+    const uint16_t declared[2] = { 1, 8 };
+    const char* who[2] = { "Snap7 1.4.3 (len=1)", "python-snap7 3.1.2 (len=8)" };
+
+    for (int k = 0; k < 2; k++)
+    {
+        reset_areas();
+        g_db1[20] = 0x00;
+
+        S7Server srv; S7SrvSession s;
+        uint8_t resp[600]; uint16_t n = 0;
+        ready(srv, s, resp, sizeof(resp));
+
+        uint8_t req[64];
+        const uint8_t one = 0x01;
+        uint16_t len = buildWrite(req, S7WLBit, 1, 1, S7AreaDB, 20 * 8 + 3,
+                                  0x03, declared[k], &one, 1);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0xFF, "%s: write refused (%02X)", who[k], resp[7 + 12 + 2]);
+        CHECK(g_db1[20] == 0x08, "%s: expected 0x08, got 0x%02X", who[k], g_db1[20]);
+
+        // And clearing one bit must leave the other seven alone.
+        g_db1[20] = 0xFF;
+        const uint8_t zero = 0x00;
+        len = buildWrite(req, S7WLBit, 1, 1, S7AreaDB, 20 * 8 + 3,
+                         0x03, declared[k], &zero, 1);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(g_db1[20] == 0xF7, "%s: expected 0xF7, got 0x%02X", who[k], g_db1[20]);
+    }
+}
+
+static void test_write_refusals()
+{
+    printf("Write Var — what it refuses\n");
+    reset_areas();
+
+    uint8_t resp[600]; uint16_t n = 0;
+    uint8_t req[64];
+    const uint8_t payload[4] = { 1, 2, 3, 4 };
+
+    // A read-only AREA.
+    {
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        const uint16_t len = buildWrite(req, S7WLByte, 4, 0, S7AreaPE, 0, 0x04, 32, payload, 4);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0x0A, "a read-only area must refuse, got %02X",
+              resp[7 + 12 + 2]);
+    }
+
+    // A read-only SERVER.
+    {
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        srv.setWriteEnabled(false);
+        const uint16_t len = buildWrite(req, S7WLByte, 4, 1, S7AreaDB, 0, 0x04, 32, payload, 4);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0x0A, "a read-only server must refuse, got %02X",
+              resp[7 + 12 + 2]);
+        CHECK(g_db1[0] == 0x00, "and must not have written anything");
+    }
+
+    // The spec says four bytes and the value carries two. Writing the shorter
+    // of the two would put a truncated value into a PLC.
+    {
+        reset_areas();
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        const uint16_t len = buildWrite(req, S7WLByte, 4, 1, S7AreaDB, 0, 0x04, 16, payload, 2);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0x07, "a size mismatch must be 0x07, got %02X",
+              resp[7 + 12 + 2]);
+        CHECK(g_db1[0] == 0x00, "and nothing may be written");
+    }
+
+    // Past the end.
+    {
+        reset_areas();
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        const uint16_t len = buildWrite(req, S7WLByte, 4, 1, S7AreaDB, 62 * 8, 0x04, 32, payload, 4);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0x05, "out of range must be 0x05, got %02X",
+              resp[7 + 12 + 2]);
+    }
+
+    // A bit write to a callback area with no bit writer: refused rather than
+    // served by a read-modify-write that would re-assert seven neighbours.
+    {
+        reset_areas();
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        const uint8_t one = 1;
+        const uint16_t len = buildWrite(req, S7WLBit, 1, 0, S7AreaMK, 3, 0x03, 1, &one, 1);
+        srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(resp[7 + 12 + 2] == 0x0A,
+              "a bit write with no bit writer must refuse, got %02X", resp[7 + 12 + 2]);
+    }
+}
+
+static void test_pdu_is_respected()
+{
+    printf("An answer never exceeds the negotiated PDU\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    srv.setAreas(AREAS, 3);
+    srv.setAccessors(cbRead, cbWrite, NULL);
+    srv.setMaxPduSize(240);          // cap BELOW the buffer we hand it
+    srv.beginSession(s);
+    srv.handle(s, CR, sizeof(CR), resp, sizeof(resp), &n);
+    srv.handle(s, SETUP, sizeof(SETUP), resp, sizeof(resp), &n);
+
+    uint8_t req[64];
+    const uint16_t len = buildRead(req, S7WLByte, 64, 1, S7AreaDB, 0);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+
+    // A client that agreed to 240 must not be sent more, however much room we
+    // happen to have.
+    CHECK(n <= 7 + 240, "answer was %u bytes against a 240-byte PDU", n);
+}
+
+//-----------------------------------------------------------------------------
 int main()
 {
     printf("S7Server protocol tests\n\n");
@@ -295,6 +652,13 @@ int main()
     test_unimplemented_is_answered();
     test_malformed_is_refused();
     test_counters();
+    test_read();
+    test_read_bit();
+    test_read_refusals();
+    test_write();
+    test_write_bit_both_conventions();
+    test_write_refusals();
+    test_pdu_is_respected();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

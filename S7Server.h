@@ -119,12 +119,22 @@
 #ifndef S7WLBit
 #define S7WLBit     0x01
 #define S7WLByte    0x02
+#define S7WLChar    0x03
 #define S7WLWord    0x04
+#define S7WLInt     0x05
 #define S7WLDWord   0x06
+#define S7WLDInt    0x07
 #define S7WLReal    0x08
 #define S7WLCounter 0x1C
 #define S7WLTimer   0x1D
 #endif
+
+/** Items one Read Var or Write Var request may carry.
+ *
+ *  20 is what Snap7 accepts and what a real CPU answers, and a client that
+ *  sends more gets the first 20 served rather than an error -- which is what
+ *  Snap7 does, so it is what clients were written against. */
+#define S7SRV_MAX_ITEMS   20
 
 //-----------------------------------------------------------------------------
 // Sizes
@@ -172,6 +182,21 @@ typedef bool (*S7SrvReadFn)(void* ctx, uint8_t area, uint16_t dbNumber,
 typedef bool (*S7SrvWriteFn)(void* ctx, uint8_t area, uint16_t dbNumber,
                              uint32_t start, uint16_t len, const uint8_t* src);
 
+/** Write ONE bit, without disturbing the other seven in its byte.
+ *
+ *  S7 addresses bits as `byte.bit`, and a callback-backed area may have real
+ *  hardware behind each bit -- eight relay outputs in a byte, say. Serving a
+ *  bit write by reading the byte, changing a bit and writing it back would
+ *  re-assert the other seven, which is a different thing from leaving them
+ *  alone and is visible on the wire if two clients write neighbouring bits.
+ *
+ *  Optional. An area served by callbacks with no bit writer refuses bit writes
+ *  with "access denied" rather than guessing -- refusing is recoverable, a
+ *  clobbered output is not. Flat-buffer areas never need this: the buffer is
+ *  the only owner of those bits, so the server updates them in place. */
+typedef bool (*S7SrvWriteBitFn)(void* ctx, uint8_t area, uint16_t dbNumber,
+                                uint32_t byteIndex, uint8_t bitIndex, bool value);
+
 /** One addressable area.
  *
  *  `dbNumber` is meaningful only for S7AreaDB; leave it 0 elsewhere. `data`
@@ -183,6 +208,17 @@ struct S7SrvArea
     uint16_t  dbNumber;
     uint8_t*  data;
     uint16_t  size;
+    /** Refuse every write to this area, whatever the server-wide setting.
+     *
+     *  Expressed as readOnly rather than writable so that leaving it out of an
+     *  aggregate initialiser -- `{ S7AreaDB, 1, db1, sizeof(db1) }`, which is
+     *  what every existing caller writes -- zero-initialises to the permissive
+     *  value and keeps meaning what it already meant.
+     *
+     *  The natural use is the process-INPUT area: it is what the field wires
+     *  drive, so a client writing it is writing a value the next input refresh
+     *  overwrites, which looks like the write was silently lost. */
+    bool      readOnly;
 };
 
 /** Per-connection state. The host owns one of these per accepted socket.
@@ -223,6 +259,10 @@ public:
      *  case that direction is refused for callback-backed areas. */
     void setAccessors(S7SrvReadFn readFn, S7SrvWriteFn writeFn, void* ctx);
 
+    /** Bit writer for callback-backed areas. Without one, a bit write to such
+     *  an area is refused rather than served by a read-modify-write. */
+    void setBitWriter(S7SrvWriteBitFn writeBitFn);
+
     /** Cap on the negotiated PDU. Clamped into [240, 960]. A client asking for
      *  more gets this; a client asking for less gets what it asked for. */
     void setMaxPduSize(uint16_t size);
@@ -252,6 +292,8 @@ public:
      *  first thing you want when a client will not talk to you. */
     uint32_t frames() const     { return FFrames; }
     uint32_t rejected() const   { return FRejected; }
+    uint32_t reads() const      { return FReads; }
+    uint32_t writes() const     { return FWrites; }
 
     /** Largest PDU this server will negotiate. */
     uint16_t maxPduSize() const { return FMaxPdu; }
@@ -261,11 +303,14 @@ private:
     uint8_t          FAreaCount;
     S7SrvReadFn      FReadFn;
     S7SrvWriteFn     FWriteFn;
+    S7SrvWriteBitFn  FWriteBitFn;
     void*            FCtx;
     uint16_t         FMaxPdu;
     bool             FWriteEnabled;
     uint32_t         FFrames;
     uint32_t         FRejected;
+    uint32_t         FReads;
+    uint32_t         FWrites;
 
     int  cotpConnect(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                      uint8_t* resp, uint16_t respCap, uint16_t* respLen);
@@ -273,8 +318,14 @@ private:
                     uint8_t* resp, uint16_t respCap, uint16_t* respLen);
     int  funNegotiate(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                       uint8_t* resp, uint16_t respCap, uint16_t* respLen);
+    int  funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                 uint8_t* resp, uint16_t respCap, uint16_t* respLen);
+    int  funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                  uint8_t* resp, uint16_t respCap, uint16_t* respLen);
     int  errorAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
                      uint16_t* respLen, uint16_t errorCode);
+
+    const S7SrvArea* findArea(uint8_t area, uint16_t dbNumber) const;
 };
 
 #endif // S7SERVER_H
