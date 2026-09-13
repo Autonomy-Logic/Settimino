@@ -106,3 +106,33 @@ errS7DataRead	LITERAL1
 errS7DataWrite	LITERAL1
 errS7Function	LITERAL1
 errBufferTooSmall	LITERAL1
+
+#######################################
+# S7 Server (Settimino 2.2.0)
+#######################################
+
+S7Server	KEYWORD1
+S7SrvSession	KEYWORD1
+S7SrvArea	KEYWORD1
+S7SrvReadFn	KEYWORD1
+S7SrvWriteFn	KEYWORD1
+
+setAreas	KEYWORD2
+setAccessors	KEYWORD2
+setMaxPduSize	KEYWORD2
+setWriteEnabled	KEYWORD2
+beginSession	KEYWORD2
+handle	KEYWORD2
+frames	KEYWORD2
+rejected	KEYWORD2
+maxPduSize	KEYWORD2
+S7IsoFrameLength	KEYWORD2
+
+S7SRV_REPLY	LITERAL1
+S7SRV_NOREPLY	LITERAL1
+S7SRV_CLOSE	LITERAL1
+S7SRV_PDU_MIN	LITERAL1
+S7SRV_PDU_MAX	LITERAL1
+S7SRV_FRAME_MAX	LITERAL1
+S7SRV_REPLY_MIN	LITERAL1
+S7ISO_HEADER_SIZE	LITERAL1
