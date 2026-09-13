@@ -29,13 +29,16 @@
 // DB1, callbacks for the merkers, so both paths are exercised.
 static uint8_t db1[256];
 static uint8_t mk[128];
+static uint8_t pe[64];
 
 static bool mkRead(void* ctx, uint8_t area, uint16_t db, uint32_t start,
                    uint16_t len, uint8_t* dest)
 {
-    (void)ctx; (void)area; (void)db;
-    if (start + len > sizeof(mk)) return false;
-    memcpy(dest, mk + start, len);
+    (void)ctx; (void)db;
+    const uint8_t* src = (area == S7AreaPE) ? pe : mk;
+    const size_t   cap = (area == S7AreaPE) ? sizeof(pe) : sizeof(mk);
+    if (start + len > cap) return false;
+    memcpy(dest, src + start, len);
     return true;
 }
 
@@ -48,12 +51,23 @@ static bool mkWrite(void* ctx, uint8_t area, uint16_t db, uint32_t start,
     return true;
 }
 
+// A mix on purpose: a flat buffer for DB1, callbacks for the merkers, and a
+// read-only process-input area -- so all three paths are exercised.
 static const S7SrvArea AREAS[] = {
-    { S7AreaDB, 1, db1,  (uint16_t)sizeof(db1) },
-    { S7AreaMK, 0, NULL, (uint16_t)sizeof(mk)  },
-    { S7AreaPE, 0, NULL, 64 },
-    { S7AreaPA, 0, NULL, 64 },
+    { S7AreaDB, 1, db1,  (uint16_t)sizeof(db1), false },
+    { S7AreaMK, 0, NULL, (uint16_t)sizeof(mk),  false },
+    { S7AreaPE, 0, NULL, (uint16_t)sizeof(pe),  true  },
 };
+
+static bool mkWriteBit(void* ctx, uint8_t area, uint16_t db, uint32_t byteIndex,
+                       uint8_t bitIndex, bool value)
+{
+    (void)ctx; (void)area; (void)db;
+    if (byteIndex >= sizeof(mk)) return false;
+    if (value) mk[byteIndex] |=  (uint8_t)(1u << bitIndex);
+    else       mk[byteIndex] &= (uint8_t)~(1u << bitIndex);
+    return true;
+}
 
 int main(int argc, char** argv)
 {
@@ -63,10 +77,12 @@ int main(int argc, char** argv)
 
     for (size_t i = 0; i < sizeof(db1); i++) db1[i] = (uint8_t)i;
     for (size_t i = 0; i < sizeof(mk);  i++) mk[i]  = (uint8_t)(0xA0 + i);
+    for (size_t i = 0; i < sizeof(pe);  i++) pe[i]  = (uint8_t)(0x50 + i);
 
     S7Server server;
     server.setAreas(AREAS, (uint8_t)(sizeof(AREAS) / sizeof(AREAS[0])));
     server.setAccessors(mkRead, mkWrite, NULL);
+    server.setBitWriter(mkWriteBit);
     server.setMaxPduSize(480);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -133,8 +149,9 @@ int main(int argc, char** argv)
         }
 
         close(cs);
-        printf("session closed  frames=%u rejected=%u\n",
-               (unsigned)server.frames(), (unsigned)server.rejected());
+        printf("session closed  frames=%u rejected=%u reads=%u writes=%u\n",
+               (unsigned)server.frames(), (unsigned)server.rejected(),
+               (unsigned)server.reads(), (unsigned)server.writes());
         fflush(stdout);
     }
 }

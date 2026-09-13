@@ -84,6 +84,50 @@ static inline void wrW(uint8_t* p, uint16_t v)
 #define S7_ERR_NONE           0x0000
 #define S7_ERR_NOT_IMPLEMENTED 0x8104
 
+// Per-ITEM result codes, carried inside the data section of a read or write
+// answer. Distinct from the header's error word: a request can succeed as a
+// request while one of its items fails, which is how a client asking for five
+// variables learns that the third does not exist without losing the other four.
+#define S7_ITEM_OK             0xFF
+#define S7_ITEM_OUT_OF_RANGE   0x05
+#define S7_ITEM_BAD_TRANSPORT  0x06
+#define S7_ITEM_SIZE_MISMATCH  0x07
+#define S7_ITEM_NOT_AVAILABLE  0x0A
+#define S7_ITEM_OVER_PDU       0x85
+
+// Transport size as it comes BACK. Note the unit changes: Bit, Byte and Int
+// report a length in BITS, Real and Octet in BYTES. Getting this backwards
+// produces a client that reads eight times too much or an eighth too little,
+// and reads plausible garbage rather than erroring.
+#define TS_RES_BIT    0x03
+#define TS_RES_BYTE   0x04
+#define TS_RES_INT    0x05
+#define TS_RES_REAL   0x07
+#define TS_RES_OCTET  0x09
+
+// One request item: 0x12, 0x0A, 0x10, transport, count(2), db(2), area, addr(3)
+#define S7_ITEM_SPEC_LEN  12
+
+/** Bytes one element of a transport size occupies. 0 means "not a transport
+ *  size this server knows", which is an error rather than a zero-length read. */
+static uint8_t elementBytes(uint8_t transport)
+{
+    switch (transport)
+    {
+        case S7WLBit:     return 1;   // S7 sends one BYTE per bit
+        case S7WLByte:    return 1;
+        case S7WLChar:    return 1;
+        case S7WLWord:    return 2;
+        case S7WLInt:     return 2;
+        case S7WLDWord:   return 4;
+        case S7WLDInt:    return 4;
+        case S7WLReal:    return 4;
+        case S7WLCounter: return 2;
+        case S7WLTimer:   return 2;
+        default:          return 0;
+    }
+}
+
 //-----------------------------------------------------------------------------
 uint16_t S7IsoFrameLength(const uint8_t* head, uint16_t have)
 {
@@ -116,6 +160,9 @@ S7Server::S7Server()
     FWriteEnabled = true;
     FFrames       = 0;
     FRejected     = 0;
+    FReads        = 0;
+    FWrites       = 0;
+    FWriteBitFn   = NULL;
 }
 
 void S7Server::setAreas(const S7SrvArea* areas, uint8_t count)
@@ -129,6 +176,11 @@ void S7Server::setAccessors(S7SrvReadFn readFn, S7SrvWriteFn writeFn, void* ctx)
     FReadFn  = readFn;
     FWriteFn = writeFn;
     FCtx     = ctx;
+}
+
+void S7Server::setBitWriter(S7SrvWriteBitFn writeBitFn)
+{
+    FWriteBitFn = writeBitFn;
 }
 
 void S7Server::setMaxPduSize(uint16_t size)
@@ -285,11 +337,10 @@ int S7Server::s7Dispatch(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
             return funNegotiate(s, req, reqLen, resp, respCap, respLen);
 
         case S7_FUN_READ:
+            return funRead(s, req, reqLen, resp, respCap, respLen);
+
         case S7_FUN_WRITE:
-            // Phase 1. Until then answer honestly rather than going silent:
-            // a client that gets "not implemented" reports a useful message,
-            // a client that gets nothing reports a timeout.
-            return errorAnswer(req, resp, respCap, respLen, S7_ERR_NOT_IMPLEMENTED);
+            return funWrite(s, req, reqLen, resp, respCap, respLen);
 
         default:
             return errorAnswer(req, resp, respCap, respLen, S7_ERR_NOT_IMPLEMENTED);
@@ -358,6 +409,532 @@ int S7Server::funNegotiate(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 
     s.pduSize = wanted;
 
+    *respLen = total;
+    return S7SRV_REPLY;
+}
+
+//-----------------------------------------------------------------------------
+// Area lookup
+//-----------------------------------------------------------------------------
+const S7SrvArea* S7Server::findArea(uint8_t area, uint16_t dbNumber) const
+{
+    // Linear: the table is a handful of entries, and a binary search over
+    // flash would cost more in code than it saves in cycles.
+    for (uint8_t i = 0; i < FAreaCount; i++)
+    {
+        const S7SrvArea* a = &FAreas[i];
+        if (a->code != area)
+            continue;
+        if (area == S7AreaDB && a->dbNumber != dbNumber)
+            continue;
+        return a;
+    }
+    return NULL;
+}
+
+//-----------------------------------------------------------------------------
+// One parsed request item.
+//-----------------------------------------------------------------------------
+namespace {
+
+struct Item
+{
+    uint8_t  transport;
+    uint16_t count;
+    uint16_t dbNumber;
+    uint8_t  area;
+    uint32_t bitAddr;    // S7 addresses are BIT addresses: byte * 8 + bit
+};
+
+/** Parse one 12-byte item spec. False when it is not a spec we understand. */
+bool parseItem(const uint8_t* p, Item& out)
+{
+    // 0x12 = variable specification, 0x10 = S7ANY addressing. Anything else is
+    // a syntax this server does not speak (symbolic addressing, for one), and
+    // guessing at it would mean answering about the wrong variable.
+    if (p[0] != 0x12 || p[2] != 0x10)
+        return false;
+    if (p[1] < 0x0A)          // declared length of the rest of the spec
+        return false;
+
+    out.transport = p[3];
+    out.count     = rdW(p + 4);
+    out.dbNumber  = rdW(p + 6);
+    out.area      = p[8];
+    out.bitAddr   = ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+    return true;
+}
+
+} // namespace
+
+//-----------------------------------------------------------------------------
+// Read Var
+//
+// Answer layout: a 12-byte AckData header, then 2 parameter bytes (function +
+// item count), then one result per item:
+//
+//     [0]    return code        0xFF, or why not
+//     [1]    transport size     TS_RES_*
+//     [2..3] length             BITS for Bit/Byte/Int, BYTES for Real/Octet
+//     [4..]  the data
+//     + one pad byte when the data length is odd AND this is not the last item
+//
+// The pad is not decoration. S7 never transfers an odd byte count between
+// items, and a client that does not find the next item where it expects it
+// reads the wrong variable rather than reporting an error.
+//-----------------------------------------------------------------------------
+int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                      uint8_t* resp, uint16_t respCap, uint16_t* respLen)
+{
+    // s7Dispatch() already held the S7 header's own length fields against what
+    // actually arrived, so reqLen has done its work by the time we get here.
+    (void)reqLen;
+
+    const uint8_t* pdu    = req + S7ISO_HEADER_SIZE;
+    const uint16_t parLen = rdW(pdu + 6);
+
+    if (parLen < 2)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    uint8_t items = pdu[S7_REQ_HEADER + 1];
+    if (items > S7SRV_MAX_ITEMS)
+        items = S7SRV_MAX_ITEMS;   // as Snap7 does: serve the first 20
+
+    // The specs must actually be present. Trusting the count over the bytes
+    // that arrived is how an item count becomes a read primitive.
+    if ((uint16_t)(2 + items * S7_ITEM_SPEC_LEN) > parLen)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    // The negotiated PDU bounds the answer, not our buffer: a client that
+    // agreed to 240 bytes must not be sent 480 because we happen to have room.
+    const uint16_t pduCap = s.pduSize ? s.pduSize : S7SRV_PDU_MIN;
+    uint16_t cap = (uint16_t)(S7ISO_HEADER_SIZE + pduCap);
+    if (cap > respCap)
+        cap = respCap;
+
+    uint8_t* out = resp + S7ISO_HEADER_SIZE;
+    uint8_t* par = out + S7_RES_HEADER;
+    par[0] = S7_FUN_READ;
+    par[1] = items;
+
+    uint16_t off = 2;   // bytes written into the data section so far
+    int16_t  budget = (int16_t)pduCap;
+
+    for (uint8_t i = 0; i < items; i++)
+    {
+        const uint8_t* spec = pdu + S7_REQ_HEADER + 2 + (uint16_t)i * S7_ITEM_SPEC_LEN;
+
+        Item it;
+        uint8_t  rc       = S7_ITEM_OK;
+        uint8_t  resTs    = 0;
+        uint16_t dataLen  = 0;   // bytes of payload
+        uint8_t* dst      = par + off + 4;
+
+        // Room for this item's 4-byte result header must exist before anything
+        // is written into it.
+        if ((uint16_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + off + 4) > cap)
+        {
+            rc = S7_ITEM_OVER_PDU;
+        }
+        else if (!parseItem(spec, it))
+        {
+            rc = S7_ITEM_BAD_TRANSPORT;
+        }
+        else
+        {
+            const uint8_t mult = elementBytes(it.transport);
+            const uint32_t size = (uint32_t)mult * it.count;
+
+            if (mult == 0)
+            {
+                rc = S7_ITEM_BAD_TRANSPORT;
+            }
+            else if (it.transport == S7WLBit && size > 1)
+            {
+                // More than one bit in a single item is not something a real
+                // S7 CPU serves, so clients do not ask for it.
+                rc = S7_ITEM_OUT_OF_RANGE;
+            }
+            else if (it.transport != S7WLBit && it.transport != S7WLTimer &&
+                     it.transport != S7WLCounter && (it.bitAddr % 8) != 0)
+            {
+                // A byte-or-wider read from a non-byte-aligned bit address is
+                // meaningless; a real CPU refuses it rather than rounding.
+                rc = S7_ITEM_OUT_OF_RANGE;
+            }
+            else if ((int32_t)size > budget)
+            {
+                rc = S7_ITEM_OVER_PDU;
+            }
+            else if ((uint32_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + off + 4) + size > cap)
+            {
+                rc = S7_ITEM_OVER_PDU;
+            }
+            else
+            {
+                const S7SrvArea* area = findArea(it.area, it.dbNumber);
+                if (area == NULL)
+                {
+                    rc = S7_ITEM_NOT_AVAILABLE;
+                }
+                else
+                {
+                    const uint32_t byteStart = it.bitAddr >> 3;
+                    const uint8_t  bitIndex  = (uint8_t)(it.bitAddr & 0x07);
+
+                    if (byteStart + size > area->size)
+                    {
+                        rc = S7_ITEM_OUT_OF_RANGE;
+                    }
+                    else if (area->data != NULL)
+                    {
+                        memcpy(dst, area->data + byteStart, (size_t)size);
+                    }
+                    else if (FReadFn != NULL &&
+                             FReadFn(FCtx, it.area, it.dbNumber, byteStart,
+                                     (uint16_t)size, dst))
+                    {
+                        // served
+                    }
+                    else
+                    {
+                        rc = S7_ITEM_OUT_OF_RANGE;
+                    }
+
+                    if (rc == S7_ITEM_OK)
+                    {
+                        budget -= (int16_t)size;
+                        dataLen = (uint16_t)size;
+
+                        switch (it.transport)
+                        {
+                            case S7WLBit:
+                                // The byte came back whole; the client asked
+                                // for one bit of it, and gets 0 or 1.
+                                dst[0] = (uint8_t)((dst[0] & (1u << bitIndex)) ? 1 : 0);
+                                resTs   = TS_RES_BIT;
+                                break;
+                            case S7WLInt:
+                            case S7WLDInt:
+                                resTs = TS_RES_INT;
+                                break;
+                            case S7WLReal:
+                                resTs = TS_RES_REAL;
+                                break;
+                            case S7WLChar:
+                            case S7WLTimer:
+                            case S7WLCounter:
+                                resTs = TS_RES_OCTET;
+                                break;
+                            default:
+                                resTs = TS_RES_BYTE;
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ((uint16_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + off + 4) > cap)
+        {
+            // Not even the failure fits. Stop and report what did.
+            par[1] = i;
+            break;
+        }
+
+        uint8_t* hdr = par + off;
+        hdr[0] = rc;
+
+        if (rc == S7_ITEM_OK)
+        {
+            hdr[1] = resTs;
+            // BITS for Bit / Byte / Int, BYTES for Real and Octet.
+            // BITS for Byte and Int, BYTES for Real and Octet -- and for
+            // TS_RES_BIT the answer is 1 either way, since one bit is one bit
+            // and its payload is one byte.
+            //
+            // Sending 1 here rather than 8 is deliberate. It is what Snap7's
+            // own server sends, what its C client expects, and what the
+            // Wireshark dissector documents. python-snap7 3.1.2's SINGLE-item
+            // read path divides every length by 8 unconditionally and so reads
+            // nothing from it -- but its MULTI-item path parses the same bytes
+            // correctly, which is the same library disagreeing with itself
+            // rather than a second convention.
+            //
+            // The asymmetry matters: sending 8 would make that one client
+            // work and would make Snap7's C client memcpy eight bytes into the
+            // one-byte buffer it allocated for a bit. A client that reads
+            // nothing has a bug; a client that overruns its buffer has a
+            // vulnerability, and we would have handed it one.
+            wrW(hdr + 2, (resTs == TS_RES_BYTE || resTs == TS_RES_INT)
+                             ? (uint16_t)(dataLen * 8)
+                             : dataLen);
+            off = (uint16_t)(off + 4 + dataLen);
+            // S7 does not carry an odd byte count between items.
+            if (i + 1 < items && (dataLen % 2) != 0)
+            {
+                hdr[4 + dataLen] = 0x00;
+                off++;
+            }
+        }
+        else
+        {
+            // A failed item carries no data, but it DOES carry a length --
+            // Snap7 sends 4, and clients parse it.
+            hdr[1] = 0x00;
+            wrW(hdr + 2, 0x0004);
+            off = (uint16_t)(off + 4);
+        }
+    }
+
+    const uint16_t total = (uint16_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + off);
+
+    resp[0] = TPKT_VERSION;
+    resp[1] = 0x00;
+    wrW(resp + 2, total);
+    resp[4] = 0x02;
+    resp[5] = COTP_PDU_DT;
+    resp[6] = 0x80;
+
+    out[0] = S7_PROTO_ID;
+    out[1] = S7_PDU_ACKDATA;
+    wrW(out + 2, 0x0000);
+    out[4] = pdu[4];
+    out[5] = pdu[5];
+    wrW(out + 6, 2);                    // parameter length
+    wrW(out + 8, (uint16_t)(off - 2));  // data length
+    // Zero even when an item failed: the failure is per item, and a header
+    // error would tell the client the whole request was rejected.
+    wrW(out + 10, S7_ERR_NONE);
+
+    FReads++;
+    *respLen = total;
+    return S7SRV_REPLY;
+}
+
+//-----------------------------------------------------------------------------
+// Write Var
+//
+// The request carries the same 12-byte item specs in its parameter section,
+// and the values in its data section, each prefixed by the same 4-byte header
+// a read answer uses. The ANSWER is one byte per item.
+//-----------------------------------------------------------------------------
+int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                       uint8_t* resp, uint16_t respCap, uint16_t* respLen)
+{
+    // See funRead: the lengths were validated upstream. The answer is one byte
+    // per item and cannot overflow the negotiated PDU, so the session is not
+    // consulted either.
+    (void)reqLen;
+    (void)s;
+
+    const uint8_t* pdu     = req + S7ISO_HEADER_SIZE;
+    const uint16_t parLen  = rdW(pdu + 6);
+    const uint16_t dataLen = rdW(pdu + 8);
+
+    if (parLen < 2)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    uint8_t items = pdu[S7_REQ_HEADER + 1];
+    if (items > S7SRV_MAX_ITEMS)
+        items = S7SRV_MAX_ITEMS;
+
+    if ((uint16_t)(2 + items * S7_ITEM_SPEC_LEN) > parLen)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    const uint8_t* dataSec = pdu + S7_REQ_HEADER + parLen;
+
+    const uint16_t total = (uint16_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + 2 + items);
+    if (total > respCap)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    uint8_t* out = resp + S7ISO_HEADER_SIZE;
+    uint8_t* par = out + S7_RES_HEADER;
+    par[0] = S7_FUN_WRITE;
+    par[1] = items;
+    uint8_t* results = par + 2;
+
+    uint16_t dOff = 0;   // walk through the request's data section
+
+    for (uint8_t i = 0; i < items; i++)
+    {
+        const uint8_t* spec = pdu + S7_REQ_HEADER + 2 + (uint16_t)i * S7_ITEM_SPEC_LEN;
+        uint8_t rc = S7_ITEM_OK;
+
+        Item it;
+        if (!parseItem(spec, it))
+        {
+            // The value's length is unknown, so the data section can no longer
+            // be walked: every later item would be read from the wrong offset.
+            results[i] = S7_ITEM_BAD_TRANSPORT;
+            for (uint8_t j = (uint8_t)(i + 1); j < items; j++)
+                results[j] = S7_ITEM_BAD_TRANSPORT;
+            break;
+        }
+
+        // Each value is prefixed by return code, transport size and length.
+        if ((uint32_t)dOff + 4 > dataLen)
+        {
+            results[i] = S7_ITEM_SIZE_MISMATCH;
+            break;
+        }
+
+        const uint8_t* vhdr    = dataSec + dOff;
+        const uint8_t  vTs     = vhdr[1];
+        const uint16_t vLenRaw = rdW(vhdr + 2);
+        const uint8_t* value   = vhdr + 4;
+
+        // How many bytes of payload this value actually occupies.
+        //
+        // The unit of the length field depends on the transport size -- BITS
+        // for Byte and Int, BYTES for Real and Octet -- and getting it
+        // backwards makes a value eight times too long or an eighth too short.
+        //
+        // TS_RES_BIT is the exception, and it is an exception because the
+        // clients disagree. A single bit is ALWAYS one byte on the wire (S7
+        // sends one byte per bit, and more than one bit per item is not a
+        // thing a CPU serves), so the length field adds nothing here -- and
+        // implementations fill it in differently:
+        //
+        //   Snap7 1.4.3 (C)      sends 1  -- the length in bits, which for one
+        //                                    bit is 1. Matches the Wireshark
+        //                                    dissector and real CPUs.
+        //   python-snap7 3.1.2   sends 8  -- its writer multiplies every
+        //                                    payload by 8 regardless of
+        //                                    transport size.
+        //
+        // Taking the payload as one byte and ignoring the declared length
+        // accepts both without guessing, and cannot be wrong: the spec already
+        // pinned the size at one bit.
+        uint16_t vBytes;
+        if (vTs == TS_RES_BIT)
+            vBytes = 1;
+        else if (vTs == TS_RES_BYTE || vTs == TS_RES_INT)
+            vBytes = (uint16_t)(vLenRaw / 8);
+        else
+            vBytes = vLenRaw;
+
+        if ((uint32_t)dOff + 4 + vBytes > dataLen)
+        {
+            results[i] = S7_ITEM_SIZE_MISMATCH;
+            break;
+        }
+
+        const uint8_t  mult = elementBytes(it.transport);
+        const uint32_t size = (uint32_t)mult * it.count;
+
+        if (!FWriteEnabled)
+        {
+            // A read-only server. A proper refusal, not a dropped connection:
+            // the client says "access denied" rather than "timeout".
+            rc = S7_ITEM_NOT_AVAILABLE;
+        }
+        else if (mult == 0)
+        {
+            rc = S7_ITEM_BAD_TRANSPORT;
+        }
+        else if (size != vBytes)
+        {
+            // The spec says how much, the value says how much, and they must
+            // agree. Writing min(a, b) would put a truncated value into a PLC.
+            rc = S7_ITEM_SIZE_MISMATCH;
+        }
+        else if (it.transport != S7WLBit && it.transport != S7WLTimer &&
+                 it.transport != S7WLCounter && (it.bitAddr % 8) != 0)
+        {
+            rc = S7_ITEM_OUT_OF_RANGE;
+        }
+        else
+        {
+            const S7SrvArea* area = findArea(it.area, it.dbNumber);
+            const uint32_t byteStart = it.bitAddr >> 3;
+            const uint8_t  bitIndex  = (uint8_t)(it.bitAddr & 0x07);
+
+            if (area == NULL)
+                rc = S7_ITEM_NOT_AVAILABLE;
+            else if (area->readOnly)
+                rc = S7_ITEM_NOT_AVAILABLE;
+            else if (byteStart + size > area->size)
+                rc = S7_ITEM_OUT_OF_RANGE;
+            else if (it.transport == S7WLBit)
+            {
+                const bool on = (value[0] != 0);
+                if (area->data != NULL)
+                {
+                    // A flat buffer owns its own bits, so updating one in
+                    // place is exactly right.
+                    if (on) area->data[byteStart] |=  (uint8_t)(1u << bitIndex);
+                    else    area->data[byteStart] &= (uint8_t)~(1u << bitIndex);
+                }
+                else if (FWriteBitFn != NULL)
+                {
+                    if (!FWriteBitFn(FCtx, it.area, it.dbNumber, byteStart, bitIndex, on))
+                        rc = S7_ITEM_OUT_OF_RANGE;
+                }
+                else
+                {
+                    // No bit writer. Refuse rather than read-modify-write the
+                    // byte: behind a callback the other seven bits may be
+                    // seven other outputs, and re-asserting them is not the
+                    // same as leaving them alone.
+                    rc = S7_ITEM_NOT_AVAILABLE;
+                }
+            }
+            else if (area->data != NULL)
+            {
+                memcpy(area->data + byteStart, value, (size_t)size);
+            }
+            else if (FWriteFn != NULL)
+            {
+                if (!FWriteFn(FCtx, it.area, it.dbNumber, byteStart, (uint16_t)size, value))
+                    rc = S7_ITEM_OUT_OF_RANGE;
+            }
+            else
+            {
+                rc = S7_ITEM_NOT_AVAILABLE;
+            }
+        }
+
+        results[i] = rc;
+
+        dOff = (uint16_t)(dOff + 4 + vBytes);
+        // The same odd-byte padding a read answer uses, in the other direction.
+        if (i + 1 < items && (vBytes % 2) != 0)
+            dOff++;
+    }
+
+    resp[0] = TPKT_VERSION;
+    resp[1] = 0x00;
+    wrW(resp + 2, total);
+    resp[4] = 0x02;
+    resp[5] = COTP_PDU_DT;
+    resp[6] = 0x80;
+
+    out[0] = S7_PROTO_ID;
+    out[1] = S7_PDU_ACKDATA;
+    wrW(out + 2, 0x0000);
+    out[4] = pdu[4];
+    out[5] = pdu[5];
+    wrW(out + 6, 2);
+    wrW(out + 8, items);
+    wrW(out + 10, S7_ERR_NONE);
+
+    FWrites++;
     *respLen = total;
     return S7SRV_REPLY;
 }
