@@ -53,6 +53,24 @@ static bool mkWrite(void* ctx, uint8_t area, uint16_t db, uint32_t start,
 
 // A mix on purpose: a flat buffer for DB1, callbacks for the merkers, and a
 // read-only process-input area -- so all three paths are exercised.
+static const S7SrvIdentity IDENTITY = {
+    "OpenPLC-TEST",              // systemName
+    "CPU 315-2 PN/DP",           // moduleName
+    "Bench",                     // plantId
+    "Original Siemens Equipment",// copyright
+    "S C-TEST00000001",          // serialNumber
+    "CPU 315-2 PN/DP",           // moduleTypeName
+    "6ES7 315-2EH14-0AB0",       // orderCode
+};
+
+static bool onControl(void* ctx, bool run)
+{
+    (void)ctx;
+    printf("  control: %s\n", run ? "START" : "STOP");
+    fflush(stdout);
+    return true;
+}
+
 static const S7SrvArea AREAS[] = {
     { S7AreaDB, 1, db1,  (uint16_t)sizeof(db1), false },
     { S7AreaMK, 0, NULL, (uint16_t)sizeof(mk),  false },
@@ -83,6 +101,8 @@ int main(int argc, char** argv)
     server.setAreas(AREAS, (uint8_t)(sizeof(AREAS) / sizeof(AREAS[0])));
     server.setAccessors(mkRead, mkWrite, NULL);
     server.setBitWriter(mkWriteBit);
+    server.setIdentity(&IDENTITY);
+    server.setControlHandler(onControl);
     server.setMaxPduSize(480);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);

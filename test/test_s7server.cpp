@@ -642,6 +642,245 @@ static void test_pdu_is_respected()
 }
 
 //-----------------------------------------------------------------------------
+// SZL (identification) and PLC Control
+//-----------------------------------------------------------------------------
+
+static const S7SrvIdentity ID = {
+    "OpenPLC-TEST", "CPU 315-2 PN/DP", "Bench", "Original Siemens Equipment",
+    "S C-TEST00000001", "CPU 315-2 PN/DP", "6ES7 315-2EH14-0AB0",
+};
+
+static int  g_controlCalls = 0;
+static bool g_controlRun   = false;
+static bool g_controlAllow = true;
+
+static bool ctrlHandler(void* ctx, bool run)
+{
+    (void)ctx;
+    g_controlCalls++;
+    g_controlRun = run;
+    return g_controlAllow;
+}
+
+/** Build an SZL read request (UserData PDU). */
+static uint16_t buildSzl(uint8_t* buf, uint16_t szlId, uint16_t index)
+{
+    uint8_t* p = buf;
+    *p++ = 0x03; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x02; *p++ = 0xF0; *p++ = 0x80;
+    *p++ = 0x32; *p++ = 0x07;                     // UserData
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x00; *p++ = 0x0A;                     // sequence
+    *p++ = 0x00; *p++ = 0x08;                     // param len
+    *p++ = 0x00; *p++ = 0x08;                     // data len
+    *p++ = 0x00; *p++ = 0x01; *p++ = 0x12;        // head
+    *p++ = 0x04; *p++ = 0x11;
+    *p++ = 0x44;                                  // request + SZL group
+    *p++ = 0x01;                                  // subfunction: read
+    *p++ = 0x00;                                  // sequence
+    *p++ = 0xFF; *p++ = 0x09;                     // data: return code, octet
+    *p++ = 0x00; *p++ = 0x04;                     // length
+    *p++ = (uint8_t)(szlId >> 8); *p++ = (uint8_t)szlId;
+    *p++ = (uint8_t)(index >> 8); *p++ = (uint8_t)index;
+    const uint16_t total = (uint16_t)(p - buf);
+    buf[2] = (uint8_t)(total >> 8); buf[3] = (uint8_t)total;
+    return total;
+}
+
+/** Build a PLC Control request (0x28 start / 0x29 stop). */
+static uint16_t buildControl(uint8_t* buf, uint8_t fun)
+{
+    uint8_t* p = buf;
+    *p++ = 0x03; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x02; *p++ = 0xF0; *p++ = 0x80;
+    *p++ = 0x32; *p++ = 0x01;
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x00; *p++ = 0x0B;
+    *p++ = 0x00; *p++ = 0x02;
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = fun;  *p++ = 0x00;
+    const uint16_t total = (uint16_t)(p - buf);
+    buf[2] = (uint8_t)(total >> 8); buf[3] = (uint8_t)total;
+    return total;
+}
+
+static void test_szl_identity()
+{
+    printf("SZL — identification\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+    srv.setIdentity(&ID);
+
+    uint8_t req[64];
+
+    // 0x001C — component identification, built from the identity.
+    uint16_t len = buildSzl(req, 0x001C, 0);
+    int r = srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(r == S7SRV_REPLY, "an SZL read must be answered");
+    CHECK(resp[8] == 0x07, "the answer is a UserData PDU, got %02X", resp[8]);
+
+    const uint8_t* par = resp + 7 + 10;
+    CHECK(par[5] == 0x84, "parameters must say response + SZL group, got %02X", par[5]);
+    CHECK(par[10] == 0x00 && par[11] == 0x00, "error must be 0");
+
+    const uint8_t* body = resp + 7 + 10 + 12;
+    CHECK(body[0] == 0xFF, "return code");
+    CHECK(((body[4] << 8) | body[5]) == 0x001C, "the SZL id must come back");
+    CHECK(((body[8] << 8) | body[9]) == 34, "record length must be 34");
+    CHECK(((body[10] << 8) | body[11]) == 10, "there are ten records");
+    // Record 1 is the station name, and a client displays it.
+    CHECK(memcmp(body + 14, "OpenPLC-TEST", 12) == 0, "record 1 must carry systemName");
+    // Record 2 at +34.
+    CHECK(memcmp(body + 14 + 34, "CPU 315-2 PN/DP", 15) == 0,
+          "record 2 must carry moduleName");
+
+    // 0x0011 — the order code.
+    len = buildSzl(req, 0x0011, 0);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(memcmp(resp + 7 + 10 + 12 + 14, "6ES7 315-2EH14-0AB0", 19) == 0,
+          "SZL 0x0011 must carry the order code");
+}
+
+static void test_szl_cpu_status()
+{
+    printf("SZL — CPU status\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+    srv.setIdentity(&ID);
+
+    uint8_t req[64];
+    const uint16_t len = buildSzl(req, 0x0424, 0);
+
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(resp[7 + 10 + 12 + 15] == S7SRV_CPU_RUN, "a fresh server reports RUN");
+
+    srv.setCpuStatus(S7SRV_CPU_STOP);
+    srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(resp[7 + 10 + 12 + 15] == S7SRV_CPU_STOP, "and reports STOP once stopped");
+}
+
+static void test_szl_without_identity()
+{
+    printf("SZL — nothing published\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));      // no setIdentity
+
+    uint8_t req[64];
+    const uint16_t len = buildSzl(req, 0x001C, 0);
+    const int r = srv.handle(s, req, len, resp, sizeof(resp), &n);
+
+    // "Not available" is a real CPU's answer for an SZL it does not keep --
+    // and it is an ANSWER, so a client that only reads and writes is unharmed.
+    CHECK(r == S7SRV_REPLY, "it must still answer");
+    const uint8_t* par = resp + 7 + 10;
+    CHECK(((par[10] << 8) | par[11]) == 0x02D4,
+          "error must be 0x02D4 'not available', got %04X", (par[10] << 8) | par[11]);
+
+    // An unknown id gets the same treatment even WITH an identity.
+    srv.setIdentity(&ID);
+    const uint16_t len2 = buildSzl(req, 0x9999, 0);
+    srv.handle(s, req, len2, resp, sizeof(resp), &n);
+    CHECK(((par[10] << 8) | par[11]) == 0x02D4, "an unknown SZL id is not available");
+}
+
+static void test_control()
+{
+    printf("PLC Control\n");
+    reset_areas();
+
+    uint8_t resp[600]; uint16_t n = 0;
+    uint8_t req[64];
+
+    // No handler: refused. Classic S7 has no authentication, so a device that
+    // stops its machine because an unauthenticated packet asked it to is a
+    // hazard. The host opts in.
+    {
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        const uint16_t len = buildControl(req, 0x29);
+        const int r = srv.handle(s, req, len, resp, sizeof(resp), &n);
+        CHECK(r == S7SRV_REPLY, "control must be answered even when refused");
+        CHECK(resp[17] == 0x81 && resp[18] == 0x04,
+              "a refusal is reported as an error, got %02X%02X", resp[17], resp[18]);
+        CHECK(srv.cpuStatus() == S7SRV_CPU_RUN, "and the status must not change");
+    }
+
+    // With a handler that agrees.
+    {
+        g_controlCalls = 0; g_controlAllow = true;
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        srv.setControlHandler(ctrlHandler);
+
+        srv.handle(s, req, buildControl(req, 0x29), resp, sizeof(resp), &n);
+        CHECK(g_controlCalls == 1 && g_controlRun == false, "stop must reach the handler");
+        CHECK(resp[17] == 0x00 && resp[18] == 0x00, "and be reported as success");
+        CHECK(srv.cpuStatus() == S7SRV_CPU_STOP, "the published status follows");
+
+        srv.handle(s, req, buildControl(req, 0x28), resp, sizeof(resp), &n);
+        CHECK(g_controlRun == true, "start must reach the handler");
+        CHECK(srv.cpuStatus() == S7SRV_CPU_RUN, "and the status follows back");
+    }
+
+    // With a handler that refuses -- a mode switch in STOP, say.
+    {
+        g_controlCalls = 0; g_controlAllow = false;
+        S7Server srv; S7SrvSession s;
+        ready(srv, s, resp, sizeof(resp));
+        srv.setControlHandler(ctrlHandler);
+        srv.setCpuStatus(S7SRV_CPU_STOP);
+
+        srv.handle(s, req, buildControl(req, 0x28), resp, sizeof(resp), &n);
+        CHECK(g_controlCalls == 1, "the handler is still consulted");
+        CHECK(resp[17] == 0x81, "a refusal is an error, not a silent success");
+        CHECK(srv.cpuStatus() == S7SRV_CPU_STOP,
+              "and a refused start must NOT report itself as running");
+    }
+}
+
+static void test_understood_but_unservable_is_answered()
+{
+    printf("A frame we understood is answered, not disconnected\n");
+    reset_areas();
+
+    S7Server srv; S7SrvSession s;
+    uint8_t resp[600]; uint16_t n = 0;
+    ready(srv, s, resp, sizeof(resp));
+
+    // A Read Var whose parameter section is one byte long and carries no items.
+    // python-snap7 3.1.2's get_cpu_state() sends exactly this and then ignores
+    // the answer. Closing on it took the session down and every later call with
+    // it; the frame parsed at every level we could resynchronise from, so the
+    // honest reply is "I cannot do that".
+    uint8_t stub[] = {
+        0x03, 0x00, 0x00, 0x12,
+        0x02, 0xF0, 0x80,
+        0x32, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00,
+        0x04
+    };
+
+    const int r = srv.handle(s, stub, sizeof(stub), resp, sizeof(resp), &n);
+    CHECK(r == S7SRV_REPLY, "it must be answered, not closed (got %d)", r);
+    CHECK(resp[17] == 0x81 && resp[18] == 0x04, "with 'not implemented'");
+
+    // And the session must still work afterwards.
+    uint8_t req[64];
+    const uint16_t len = buildRead(req, S7WLByte, 4, 1, S7AreaDB, 0);
+    const int r2 = srv.handle(s, req, len, resp, sizeof(resp), &n);
+    CHECK(r2 == S7SRV_REPLY && resp[7 + 12 + 2] == 0xFF,
+          "the connection must still serve reads");
+}
+
+//-----------------------------------------------------------------------------
 int main()
 {
     printf("S7Server protocol tests\n\n");
@@ -659,6 +898,11 @@ int main()
     test_write_bit_both_conventions();
     test_write_refusals();
     test_pdu_is_respected();
+    test_szl_identity();
+    test_szl_cpu_status();
+    test_szl_without_identity();
+    test_control();
+    test_understood_but_unservable_is_answered();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

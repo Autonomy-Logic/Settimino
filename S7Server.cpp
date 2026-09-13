@@ -78,6 +78,8 @@ static inline void wrW(uint8_t* p, uint16_t v)
 #define S7_FUN_READ       0x04
 #define S7_FUN_WRITE      0x05
 #define S7_FUN_NEGOTIATE  0xF0
+#define S7_FUN_START      0x28
+#define S7_FUN_STOP       0x29
 
 // Error codes carried in the type-3 header (big-endian word).
 // 0x8104 is what a real CPU answers for "this service is not implemented".
@@ -163,6 +165,9 @@ S7Server::S7Server()
     FReads        = 0;
     FWrites       = 0;
     FWriteBitFn   = NULL;
+    FIdentity     = NULL;
+    FControlFn    = NULL;
+    FCpuStatus    = S7SRV_CPU_RUN;
 }
 
 void S7Server::setAreas(const S7SrvArea* areas, uint8_t count)
@@ -181,6 +186,21 @@ void S7Server::setAccessors(S7SrvReadFn readFn, S7SrvWriteFn writeFn, void* ctx)
 void S7Server::setBitWriter(S7SrvWriteBitFn writeBitFn)
 {
     FWriteBitFn = writeBitFn;
+}
+
+void S7Server::setIdentity(const S7SrvIdentity* identity)
+{
+    FIdentity = identity;
+}
+
+void S7Server::setCpuStatus(uint8_t status)
+{
+    FCpuStatus = status;
+}
+
+void S7Server::setControlHandler(S7SrvControlFn fn)
+{
+    FControlFn = fn;
 }
 
 void S7Server::setMaxPduSize(uint16_t size)
@@ -329,10 +349,21 @@ int S7Server::s7Dispatch(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
         return S7SRV_CLOSE;
     }
 
+    // A UserData PDU is a different animal: its header has no error word and
+    // its parameters carry a group and subfunction rather than a function.
+    if (pdu[1] == S7_PDU_USERDATA)
+        return userData(s, req, reqLen, resp, respCap, respLen);
+
     const uint8_t fun = pdu[S7_REQ_HEADER];
 
     switch (fun)
     {
+        case S7_FUN_START:
+            return funControl(s, req, reqLen, resp, respCap, respLen, true);
+
+        case S7_FUN_STOP:
+            return funControl(s, req, reqLen, resp, respCap, respLen, false);
+
         case S7_FUN_NEGOTIATE:
             return funNegotiate(s, req, reqLen, resp, respCap, respLen);
 
@@ -493,11 +524,17 @@ int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
     const uint8_t* pdu    = req + S7ISO_HEADER_SIZE;
     const uint16_t parLen = rdW(pdu + 6);
 
+    // Too short to carry an item count. ANSWERED, not closed -- see the note on
+    // errorAnswer(): the frame parsed at every level we could resynchronise
+    // from, so the honest reply is "I cannot do that", and dropping the session
+    // would cost the client every other thing it was doing.
+    //
+    // Not hypothetical: python-snap7 3.1.2's get_cpu_state() sends exactly this
+    // -- a Read Var with a one-byte parameter section and no items -- and then
+    // ignores whatever comes back. Closing on it took down the connection and
+    // every subsequent call with it.
     if (parLen < 2)
-    {
-        FRejected++;
-        return S7SRV_CLOSE;
-    }
+        return errorAnswer(req, resp, respCap, respLen, S7_ERR_NOT_IMPLEMENTED);
 
     uint8_t items = pdu[S7_REQ_HEADER + 1];
     if (items > S7SRV_MAX_ITEMS)
@@ -739,10 +776,7 @@ int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
     const uint16_t dataLen = rdW(pdu + 8);
 
     if (parLen < 2)
-    {
-        FRejected++;
-        return S7SRV_CLOSE;
-    }
+        return errorAnswer(req, resp, respCap, respLen, S7_ERR_NOT_IMPLEMENTED);
 
     uint8_t items = pdu[S7_REQ_HEADER + 1];
     if (items > S7SRV_MAX_ITEMS)
@@ -940,12 +974,301 @@ int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 }
 
 //-----------------------------------------------------------------------------
+// PLC Control — start and stop
+//
+// Answer shape is the smallest a type-3 AckData can be: the 12-byte header
+// plus a single parameter byte echoing the function.
+//-----------------------------------------------------------------------------
+int S7Server::funControl(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                         uint8_t* resp, uint16_t respCap, uint16_t* respLen,
+                         bool run)
+{
+    (void)s; (void)reqLen;
+
+    const uint8_t* pdu   = req + S7ISO_HEADER_SIZE;
+    const uint16_t total = (uint16_t)(S7ISO_HEADER_SIZE + S7_RES_HEADER + 1);
+    if (respCap < total)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    // No handler means no. Classic S7 has no authentication whatsoever, so a
+    // device that stops its machine because an unauthenticated packet asked it
+    // to is a hazard, not a feature. The host opts in.
+    bool accepted = false;
+    if (FControlFn != NULL)
+        accepted = FControlFn(FCtx, run);
+
+    if (accepted)
+        FCpuStatus = run ? S7SRV_CPU_RUN : S7SRV_CPU_STOP;
+
+    resp[0] = TPKT_VERSION;
+    resp[1] = 0x00;
+    wrW(resp + 2, total);
+    resp[4] = 0x02;
+    resp[5] = COTP_PDU_DT;
+    resp[6] = 0x80;
+
+    uint8_t* out = resp + S7ISO_HEADER_SIZE;
+    out[0] = S7_PROTO_ID;
+    out[1] = S7_PDU_ACKDATA;
+    wrW(out + 2, 0x0000);
+    out[4] = pdu[4];
+    out[5] = pdu[5];
+    wrW(out + 6, 1);
+    wrW(out + 8, 0);
+    // A refusal is reported as an error rather than as a success that did
+    // nothing, so the client can tell the difference.
+    wrW(out + 10, accepted ? S7_ERR_NONE : S7_ERR_NOT_IMPLEMENTED);
+    out[S7_RES_HEADER] = pdu[S7_REQ_HEADER];   // echo the function
+
+    *respLen = total;
+    return S7SRV_REPLY;
+}
+
+//-----------------------------------------------------------------------------
+// System Status List
+//-----------------------------------------------------------------------------
+namespace {
+
+/** SZL 0x0011 — module identification. The bytes are a real S7-315's, with
+ *  the order code patched in; a client reads the MlfB out of record 1. */
+const uint8_t SZL_0011[] = {
+    0xFF, 0x09, 0x00, 0x78, 0x00, 0x11, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x04,
+    0x00, 0x01, '6','E','S','7',' ','3','1','5','-','2','E','H','1','4','-','0','A','B','0',' ',
+    0x00, 0xC0, 0x00, 0x04, 0x00, 0x01,
+    0x00, 0x06, '6','E','S','7',' ','3','1','5','-','2','E','H','1','4','-','0','A','B','0',' ',
+    0x00, 0xC0, 0x00, 0x04, 0x00, 0x01,
+    0x00, 0x07, ' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',
+    0x00, 0xC0, 0x56, 0x03, 0x02, 0x06,
+    0x00, 0x81, 'B','o','o','t',' ','L','o','a','d','e','r',' ',' ',' ',' ',' ',' ',' ',' ',' ',
+    0x00, 0x00, 0x41, 0x20, 0x09, 0x09
+};
+
+/** SZL 0x0424 — CPU mode. Byte 15 is the status, patched at send time. */
+const uint8_t SZL_0424[] = {
+    0xFF, 0x09, 0x00, 0x1C, 0x04, 0x24, 0x00, 0x00, 0x00, 0x14, 0x00, 0x01,
+    0x51, 0x44, 0xFF,
+    0x08,                                     // <- CPU status
+    0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x94, 0x02, 0x05, 0x02, 0x01, 0x55, 0x90, 0x67
+};
+
+/** Offset of the status byte within SZL_0424. */
+const uint8_t SZL_0424_STATUS_OFFSET = 15;
+
+/** SZL 0x001C record numbers, in the order a real CPU emits them. */
+const uint8_t SZL_001C_RECORDS[] = { 1, 2, 3, 4, 5, 7, 8, 9, 10, 11 };
+const uint8_t SZL_001C_RECORD_COUNT = 10;
+const uint8_t SZL_001C_STRING_LEN   = 32;
+const uint8_t SZL_001C_RECORD_LEN   = 2 + SZL_001C_STRING_LEN;
+
+/** Copy a C string into a fixed-width, zero-padded SZL field. */
+void szlString(uint8_t* dst, const char* src, uint8_t width)
+{
+    uint8_t i = 0;
+    if (src != NULL)
+        for (; i < width && src[i] != '\0'; i++)
+            dst[i] = (uint8_t)src[i];
+    for (; i < width; i++)
+        dst[i] = 0x00;
+}
+
+} // namespace
+
+/** Build one SZL answer. Returns the payload length, or 0 for "not available". */
+int S7Server::szlAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
+                        uint16_t* respLen, uint16_t szlId, uint16_t szlIndex)
+{
+    const uint8_t* pdu = req + S7ISO_HEADER_SIZE;
+    const uint8_t* rp  = pdu + S7_REQ_HEADER;
+
+    // A UserData answer is a type-7 header (10 bytes, no error word) plus a
+    // 12-byte parameter block, and only then the SZL data.
+    const uint16_t fixed = S7ISO_HEADER_SIZE + 10 + 12;
+    if (respCap < fixed + 8)
+    {
+        FRejected++;
+        return S7SRV_CLOSE;
+    }
+
+    uint8_t* data    = resp + fixed;
+    uint16_t dataLen = 0;
+    uint16_t err     = 0x0000;
+
+    const uint16_t room = (uint16_t)(respCap - fixed);
+
+    if (FIdentity == NULL)
+    {
+        // No identity published. "Not available" is a real CPU's answer for an
+        // SZL it does not keep, so a client that can cope will cope.
+        err = 0x02D4;
+        data[0] = 0x0A; data[1] = 0x00; data[2] = 0x00; data[3] = 0x00;
+        dataLen = 4;
+    }
+    else if (szlId == 0x0011 && sizeof(SZL_0011) <= room)
+    {
+        memcpy(data, SZL_0011, sizeof(SZL_0011));
+        if (FIdentity->orderCode != NULL)
+        {
+            // Both order-code records carry the same MlfB on a real CPU.
+            szlString(data + 14, FIdentity->orderCode, 20);
+            szlString(data + 48, FIdentity->orderCode, 20);
+        }
+        dataLen = (uint16_t)sizeof(SZL_0011);
+    }
+    else if (szlId == 0x0424 && sizeof(SZL_0424) <= room)
+    {
+        memcpy(data, SZL_0424, sizeof(SZL_0424));
+        data[SZL_0424_STATUS_OFFSET] = FCpuStatus;
+        dataLen = (uint16_t)sizeof(SZL_0424);
+    }
+    else if (szlId == 0x001C)
+    {
+        // Built rather than templated: every field is the project's, so there
+        // is nothing constant to keep in flash but the shape.
+        const uint16_t body  = (uint16_t)(SZL_001C_RECORD_COUNT * SZL_001C_RECORD_LEN);
+        const uint16_t total = (uint16_t)(4 + 4 + 4 + body);
+        if (total > room)
+        {
+            err = 0x02D4;
+            data[0] = 0x0A; data[1] = 0x00; data[2] = 0x00; data[3] = 0x00;
+            dataLen = 4;
+        }
+        else
+        {
+            data[0] = 0xFF;                       // return code
+            data[1] = 0x09;                       // transport: octet string
+            wrW(data + 2, (uint16_t)(total - 4)); // payload length
+            wrW(data + 4, 0x001C);                // SZL id
+            wrW(data + 6, 0x0000);                // index
+            wrW(data + 8, SZL_001C_RECORD_LEN);   // bytes per record
+            wrW(data + 10, SZL_001C_RECORD_COUNT);
+
+            uint8_t* rec = data + 12;
+            for (uint8_t i = 0; i < SZL_001C_RECORD_COUNT; i++)
+            {
+                const uint8_t index = SZL_001C_RECORDS[i];
+                wrW(rec, index);
+
+                const char* value = NULL;
+                switch (index)
+                {
+                    case 1:  value = FIdentity->systemName;     break;
+                    case 2:  value = FIdentity->moduleName;     break;
+                    case 3:  value = FIdentity->plantId;        break;
+                    case 4:  value = FIdentity->copyright;      break;
+                    case 5:  value = FIdentity->serialNumber;   break;
+                    case 7:  value = FIdentity->moduleTypeName; break;
+                    default: value = NULL;                      break;
+                }
+                szlString(rec + 2, value, SZL_001C_STRING_LEN);
+                rec += SZL_001C_RECORD_LEN;
+            }
+            dataLen = total;
+        }
+    }
+    else
+    {
+        err = 0x02D4;
+        data[0] = 0x0A; data[1] = 0x00; data[2] = 0x00; data[3] = 0x00;
+        dataLen = 4;
+    }
+
+    (void)szlIndex;
+
+    const uint16_t total = (uint16_t)(fixed + dataLen);
+
+    resp[0] = TPKT_VERSION;
+    resp[1] = 0x00;
+    wrW(resp + 2, total);
+    resp[4] = 0x02;
+    resp[5] = COTP_PDU_DT;
+    resp[6] = 0x80;
+
+    uint8_t* out = resp + S7ISO_HEADER_SIZE;
+    out[0] = S7_PROTO_ID;
+    out[1] = S7_PDU_USERDATA;
+    wrW(out + 2, 0x0000);
+    out[4] = pdu[4];
+    out[5] = pdu[5];
+    wrW(out + 6, 12);        // parameter length
+    wrW(out + 8, dataLen);
+
+    uint8_t* par = out + 10;
+    par[0] = rp[0]; par[1] = rp[1]; par[2] = rp[2];   // echo 00 01 12
+    par[3] = 0x08;                                    // parameter length
+    par[4] = 0x12;
+    par[5] = 0x84;                                    // response + SZL group
+    par[6] = rp[6];                                   // subfunction
+    par[7] = rp[7];                                   // sequence
+    wrW(par + 8, 0x0000);                             // no further packets
+    wrW(par + 10, err);
+
+    *respLen = total;
+    return S7SRV_REPLY;
+}
+
+//-----------------------------------------------------------------------------
+// UserData dispatch. Only the SZL group is served; everything else is answered
+// "not available" rather than ignored.
+//-----------------------------------------------------------------------------
+int S7Server::userData(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                       uint8_t* resp, uint16_t respCap, uint16_t* respLen)
+{
+    (void)s;
+
+    const uint8_t* pdu    = req + S7ISO_HEADER_SIZE;
+    const uint16_t pduLen = (uint16_t)(reqLen - S7ISO_HEADER_SIZE);
+    const uint16_t parLen = rdW(pdu + 6);
+
+    // As in funRead: understood, but not something we can serve. Answer it.
+    if (pduLen < S7_REQ_HEADER + 8 || parLen < 8)
+        return szlAnswer(req, resp, respCap, respLen, 0xFFFF, 0);
+
+    const uint8_t* rp     = pdu + S7_REQ_HEADER;
+    const uint8_t  group  = (uint8_t)(rp[5] & 0x0F);
+    const uint8_t  subFun = rp[6];
+
+    if (group != 0x04)      // 0x44 = request + SZL; the low nibble is the group
+        return szlAnswer(req, resp, respCap, respLen, 0xFFFF, 0);
+
+    if (subFun == 0x02)     // system state
+        return szlAnswer(req, resp, respCap, respLen, 0xFFFF, 0);
+
+    if (subFun != 0x01)
+        return szlAnswer(req, resp, respCap, respLen, 0xFFFF, 0);
+
+    // The SZL id and index live in the data section, behind a 4-byte header.
+    const uint16_t dataLen = rdW(pdu + 8);
+    if (dataLen < 8)
+        return szlAnswer(req, resp, respCap, respLen, 0xFFFF, 0);
+
+    const uint8_t* d = pdu + S7_REQ_HEADER + parLen;
+    return szlAnswer(req, resp, respCap, respLen, rdW(d + 4), rdW(d + 6));
+}
+
+//-----------------------------------------------------------------------------
 // A well-formed AckData carrying nothing but an error.
 //
 // Worth doing properly: "not implemented" is a documented S7 answer, and a
 // client that receives it says so. Closing the connection instead produces a
 // timeout, which is the least informative failure there is and the one that
 // gets reported as "your device is broken".
+//
+// WHEN TO ANSWER AND WHEN TO CLOSE. The two failures are different and the
+// server treats them differently:
+//
+//   CLOSE   the byte stream can no longer be trusted -- a TPKT length that
+//           disagrees with what arrived, a COTP header longer than its frame,
+//           S7 parameter and data lengths that do not add up. There is no
+//           resynchronisation point in a TPKT stream, so continuing means
+//           parsing from an unknown offset.
+//
+//   ANSWER  the frame parsed at every level, and what it asks for is merely
+//           something this server will not do. Dropping the session there
+//           costs the client everything else it was doing, for no gain.
 //-----------------------------------------------------------------------------
 int S7Server::errorAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
                           uint16_t* respLen, uint16_t errorCode)
