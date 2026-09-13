@@ -82,7 +82,21 @@
 //
 //*********************************************************************
 
-#define ARDUINO_LAN    
+//*********************************************************************
+//  AUTOMATIC SELECTION
+//
+//  A define below is still honoured if you set one -- either by
+//  uncommenting it here, or (better, because it survives a library
+//  update) by passing it as a build flag. If NONE is set, the platform
+//  is deduced from the macros the core itself defines, so a library
+//  installed by a tool rather than by hand does not need editing.
+//
+//  Deduction is deliberately conservative: it only recognises families
+//  it can be sure of, and falls back to ARDUINO_LAN -- which is what
+//  this file shipped hardcoded, so the default behaviour is unchanged.
+//*********************************************************************
+
+//#define ARDUINO_LAN
 //#define ESP8266_FAMILY  
 //#define ESP32_WIFI
 //#define M5STACK_WIFI
@@ -91,7 +105,37 @@
 //#define GIGA_R1_LAN
 //#define ESP32_S3_ETH
 
-#include <SPI.h>
+#if !defined(ARDUINO_LAN)    && !defined(ESP8266_FAMILY) && \
+    !defined(ESP32_WIFI)     && !defined(M5STACK_WIFI)   && \
+    !defined(M5STACK_LAN)    && !defined(PORTENTA)       && \
+    !defined(GIGA_R1_LAN)    && !defined(ESP32_S3_ETH)
+
+  #if defined(ESP8266)
+    #define ESP8266_FAMILY
+  #elif defined(ARDUINO_ESP32S3_DEV) && defined(ETH_PHY_CS)
+    // The Waveshare ESP32-S3-ETH carries its PHY pins in the variant.
+    #define ESP32_S3_ETH
+  #elif defined(ESP32)
+    #define ESP32_WIFI
+  #elif defined(ARDUINO_GIGA)
+    #define GIGA_R1_LAN
+  #elif defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_C33)
+    #define PORTENTA
+  #else
+    // Every other core that provides <Ethernet.h>: the classic shield,
+    // and every wired board that emulates its API.
+    #define ARDUINO_LAN
+  #endif
+
+#endif
+
+// SPI is what the classic W5x00 shields ride on. The boards with a MAC of
+// their own do not need it, and on a core without an SPI library -- which
+// a wired-Ethernet MCU may well be -- including it unconditionally is a
+// compile error rather than a missing feature.
+#if !defined(S7_NO_SPI)
+  #include <SPI.h>
+#endif
 
 // Platforms 
 
