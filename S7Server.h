@@ -221,6 +221,45 @@ struct S7SrvArea
     bool      readOnly;
 };
 
+/** CPU mode, as SZL 0x0424 reports it and as PLC Control sets it. */
+#define S7SRV_CPU_RUN   0x08
+#define S7SRV_CPU_STOP  0x04
+
+/**
+ * What the CPU says it is when a client asks.
+ *
+ * Many clients query the System Status List to identify a CPU BEFORE doing
+ * anything useful -- python-snap7's read/write path never does, TIA Portal and
+ * several HMIs do, and some refuse to talk to a device that will not answer.
+ * So this is not decoration: for those clients it is the difference between a
+ * device that works and one that appears broken.
+ *
+ * Every field is a `const char*` that must outlive the server; string literals
+ * or PROGMEM-adjacent flash data are the intended use. NULL fields are sent as
+ * empty, which is what a real CPU does for a designation nobody set.
+ *
+ * The record numbers are SZL 0x001C's, and they are what a client displays --
+ * `moduleName` is the "CPU type" an HMI shows, `serialNumber` the one an asset
+ * register records.
+ */
+struct S7SrvIdentity
+{
+    const char* systemName;      // SZL 001C record 1  -- the station name
+    const char* moduleName;      // record 2           -- e.g. "CPU 315-2 PN/DP"
+    const char* plantId;         // record 3           -- plant designation
+    const char* copyright;       // record 4
+    const char* serialNumber;    // record 5
+    const char* moduleTypeName;  // record 7
+    const char* orderCode;       // SZL 0011 MlfB      -- e.g. "6ES7 315-2EH14-0AB0"
+};
+
+/** Asked to change CPU mode. Return false to refuse.
+ *
+ *  Refusing is a real answer: a device whose mode switch is in STOP should say
+ *  so rather than pretend it started. The server reports the outcome either
+ *  way, and only updates the status it publishes when the handler agreed. */
+typedef bool (*S7SrvControlFn)(void* ctx, bool run);
+
 /** Per-connection state. The host owns one of these per accepted socket.
  *
  *  It is deliberately a plain struct with no constructor: an embedded host
@@ -272,6 +311,23 @@ public:
      *  The refusal is a proper S7 error, not a dropped connection. */
     void setWriteEnabled(bool enabled);
 
+    /** Publish an identity through the System Status List.
+     *
+     *  Without one, SZL requests are answered "not available" -- which is a
+     *  legitimate answer a real CPU also gives, and costs a client nothing if
+     *  it only reads and writes. With one, clients that identify before
+     *  talking will talk. */
+    void setIdentity(const S7SrvIdentity* identity);
+
+    /** The mode this CPU reports: S7SRV_CPU_RUN or S7SRV_CPU_STOP. */
+    void setCpuStatus(uint8_t status);
+    uint8_t cpuStatus() const { return FCpuStatus; }
+
+    /** Handle PLC Control (start / stop). Without one, control requests are
+     *  refused -- which is the right default: a protocol with no authentication
+     *  should not stop a machine because a stray packet asked it to. */
+    void setControlHandler(S7SrvControlFn fn);
+
     /** Reset per-connection state. Call once per accepted connection. */
     void beginSession(S7SrvSession& session);
 
@@ -311,6 +367,9 @@ private:
     uint32_t         FRejected;
     uint32_t         FReads;
     uint32_t         FWrites;
+    const S7SrvIdentity* FIdentity;
+    S7SrvControlFn   FControlFn;
+    uint8_t          FCpuStatus;
 
     int  cotpConnect(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                      uint8_t* resp, uint16_t respCap, uint16_t* respLen);
@@ -322,6 +381,12 @@ private:
                  uint8_t* resp, uint16_t respCap, uint16_t* respLen);
     int  funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                   uint8_t* resp, uint16_t respCap, uint16_t* respLen);
+    int  funControl(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                    uint8_t* resp, uint16_t respCap, uint16_t* respLen, bool run);
+    int  userData(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
+                  uint8_t* resp, uint16_t respCap, uint16_t* respLen);
+    int  szlAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
+                   uint16_t* respLen, uint16_t szlId, uint16_t szlIndex);
     int  errorAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
                      uint16_t* respLen, uint16_t errorCode);
 
