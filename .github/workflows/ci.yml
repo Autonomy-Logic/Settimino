@@ -1,0 +1,113 @@
+# The library claims architectures=*. This checks it.
+#
+# Two jobs, answering two different questions:
+#
+#   protocol  — are the bytes right? Runs the host tests under AddressSanitizer
+#               and UBSan, then points a real python-snap7 client at the engine.
+#               Fast, and it catches everything that is not platform-specific.
+#
+#   compile   — does it build where we say it builds? One job per architecture
+#               family, because "it compiles on my Uno" has never meant it
+#               compiles on Xtensa.
+#
+# The server is transport-free, so the protocol job needs no board and no
+# network — which is the point, and why it can gate every pull request.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  protocol:
+    name: Protocol tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests under ASan + UBSan
+        working-directory: test
+        run: make test
+
+      - name: Install python-snap7
+        run: pip install python-snap7
+
+      # Snap7's own client is the reference implementation of a protocol with
+      # no published standard. If it disagrees with us, we are wrong.
+      - name: Interop against python-snap7
+        working-directory: test
+        run: make interop
+
+  compile:
+    name: Compile — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AVR is the floor. The client's _EXTENDED memory model does not fit
+          # a Uno, so the AVR entry builds the SERVER example only — which is
+          # itself worth knowing: the server is small enough for an ATmega.
+          - name: AVR (Mega 2560)
+            fqbn: arduino:avr:mega
+            platform: arduino:avr
+            libraries: Ethernet
+            sketches: examples/S7Server_Basic
+
+          - name: SAMD (MKR1000)
+            fqbn: arduino:samd:mkr1000
+            platform: arduino:samd
+            libraries: Ethernet
+            sketches: examples/S7Server_Basic
+
+          - name: ESP32
+            fqbn: esp32:esp32:esp32
+            platform: esp32:esp32
+            url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+            libraries: Ethernet
+            sketches: examples/S7Server_Basic
+
+          - name: ESP8266
+            fqbn: esp8266:esp8266:nodemcuv2
+            platform: esp8266:esp8266
+            url: https://arduino.esp8266.com/stable/package_esp8266com_index.json
+            libraries: Ethernet
+            sketches: examples/S7Server_Basic
+
+          - name: RP2040 (Pico)
+            fqbn: rp2040:rp2040:rpipico
+            platform: rp2040:rp2040
+            url: https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+            libraries: Ethernet
+            sketches: examples/S7Server_Basic
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install core
+        run: |
+          if [ -n "${{ matrix.url }}" ]; then
+            arduino-cli core update-index --additional-urls "${{ matrix.url }}"
+            arduino-cli core install ${{ matrix.platform }} --additional-urls "${{ matrix.url }}"
+          else
+            arduino-cli core update-index
+            arduino-cli core install ${{ matrix.platform }}
+          fi
+
+      - name: Install library dependencies
+        run: arduino-cli lib install ${{ matrix.libraries }}
+
+      # Install THIS checkout as the library, so the compile exercises the code
+      # in the pull request rather than whatever is published.
+      - name: Install this checkout as a library
+        run: |
+          mkdir -p "$HOME/Arduino/libraries"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/Arduino/libraries/Settimino"
+
+      - name: Compile
+        run: arduino-cli compile --fqbn ${{ matrix.fqbn }} --warnings all ${{ matrix.sketches }}
