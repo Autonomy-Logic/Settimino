@@ -85,15 +85,10 @@
 //*********************************************************************
 //  AUTOMATIC SELECTION
 //
-//  A define below is still honoured if you set one -- either by
-//  uncommenting it here, or (better, because it survives a library
-//  update) by passing it as a build flag. If NONE is set, the platform
-//  is deduced from the macros the core itself defines, so a library
-//  installed by a tool rather than by hand does not need editing.
-//
-//  Deduction is deliberately conservative: it only recognises families
-//  it can be sure of, and falls back to ARDUINO_LAN -- which is what
-//  this file shipped hardcoded, so the default behaviour is unchanged.
+//  A define below is still honoured if you set one, either here or as a build
+//  flag. If none is set, the platform is deduced from the macros the core
+//  defines, so a tool-installed library needs no editing. The fallback is
+//  ARDUINO_LAN, which is what this file shipped hardcoded.
 //*********************************************************************
 
 //#define ARDUINO_LAN
@@ -129,18 +124,11 @@
 
 #endif
 
-// <SPI.h> is NOT included here.
-//
-// Only two boards in this file drive SPI directly -- ESP32_S3_ETH and
-// M5STACK_LAN, both in EthernetInit() -- and each now includes it in its own
-// branch below. Every other board reaches the bus, if at all, through its
-// Ethernet or WiFi library, which includes what it needs itself.
-//
-// Including it unconditionally was not merely redundant, it was a build
-// failure: a wired-Ethernet MCU with an on-chip MAC may ship an <SPI.h> that
-// `#error`s on a board with no SPI bus wired out. The TI Tiva cores are one
-// such case ("LauncPad not supported"), so on those the library could not be
-// compiled at all -- for a header it never used.
+// <SPI.h> is NOT included here. Only ESP32_S3_ETH and M5STACK_LAN drive SPI
+// directly, and each includes it in its own branch below; every other board
+// reaches the bus through its Ethernet or WiFi library. Including it
+// unconditionally was a build failure on cores whose <SPI.h> #errors when no SPI
+// bus is wired out.
 
 // Platforms 
 

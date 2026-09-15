@@ -1,39 +1,18 @@
 /*
-  S7Server_Basic — be an S7 CPU that an HMI can read and write.
+  S7Server_Basic — be an S7 CPU that a client can read and write.
 
-  Settimino's other examples dial a PLC and ask it questions. This one waits to
-  be asked: point TIA Portal, an HMI, python-snap7 or another Settimino sketch
-  at this board's IP on port 102 and it will read and write the areas below.
-
-  ---------------------------------------------------------------------------
-  THE SERVER OWNS NO SOCKET, AND THAT IS WHY THIS LOOP LOOKS LIKE THIS
-  ---------------------------------------------------------------------------
+  Settimino's other examples dial a PLC and ask it questions; this one waits to
+  be asked. Point any S7 client at this board's IP on TCP port 102 and it will
+  read and write the areas below.
 
   S7Server is a protocol engine: you hand it a frame, it hands you a reply. All
-  the socket work below is yours, which means it is also yours to change --
-  swap EthernetServer for WiFiServer, or for whatever your platform offers, and
-  the protocol code is untouched.
+  the socket work below is yours, so swap EthernetServer for WiFiServer or
+  whatever your platform offers and the protocol code is untouched. It also
+  means this loop() never blocks waiting for a peer.
 
-  It also means this loop() never blocks. It reads what has arrived and returns;
-  it never waits for a peer. On a board that is also doing something real --
-  running a control loop, driving outputs -- that is the difference between a
-  server and a hazard.
-
-  ---------------------------------------------------------------------------
-  PORT 102 IS PRIVILEGED ON A PC, NOT ON A BOARD
-  ---------------------------------------------------------------------------
-
-  S7 lives on TCP 102. A board binds it freely. If you test against a PC-hosted
-  client first, that is the port it will dial.
-
-  ---------------------------------------------------------------------------
-  THERE IS NO AUTHENTICATION IN CLASSIC S7. NONE.
-  ---------------------------------------------------------------------------
-
-  Anyone who can reach this port can read and write every area you register.
-  That is the protocol, not this implementation -- a real S7-300 offers exactly
-  the same guarantee. Put it on a trusted segment, and consider
-  setWriteEnabled(false) if the clients only need to read.
+  Classic S7 has no authentication and no encryption: anyone who can reach this
+  port can read and write every area you register. Put it on a trusted segment,
+  and consider setWriteEnabled(false) if the clients only need to read.
 */
 
 #include <SPI.h>
@@ -50,14 +29,9 @@ S7Server     server;
 S7SrvSession session;
 
 // ---------------------------------------------------------------------------
-// The address space.
-//
-// DB1 is a flat buffer: the client reads and writes it directly, and the
-// sketch can look at it whenever it likes. That is the simple case.
-//
+// The address space. DB1 is a flat buffer the client reads and writes directly.
 // The merker area has no buffer (data = NULL) and is served by the callbacks
-// below instead. Use that when the values do not live in memory as a block --
-// a sensor read on demand, a register file, a PLC image assembled per scan.
+// below instead, for values that do not live in memory as a block.
 // ---------------------------------------------------------------------------
 
 static uint8_t db1[64];

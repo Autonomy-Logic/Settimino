@@ -17,18 +17,12 @@
 |=============================================================================*/
 
 /*
-  The protocol is Snap7's -- this is the server side of what Settimino's client
-  already speaks, and Snap7's TS7Worker is the reference for it. No protocol
-  behaviour here is invented; where a choice existed it was made the way a real
-  S7-300 makes it, because that is what the clients in the field were written
-  against.
+  The protocol is Snap7's -- the server side of what Settimino's client already
+  speaks. Where a choice existed it was made the way a real S7-300 makes it.
 
-  Everything is written against the byte stream rather than against packed
-  structs. Snap7 can afford `#pragma pack(1)` overlays because it runs on
-  hosts with settled ABIs; a library that compiles for AVR, ARM, Xtensa and
-  RISC-V cannot, and a misaligned 16-bit load is a fault on some of them and a
-  silently wrong value on others. Byte offsets are tedious and they are right
-  everywhere.
+  Everything is written against the byte stream rather than packed structs,
+  because a library compiling for AVR, ARM, Xtensa and RISC-V cannot rely on
+  `#pragma pack(1)` overlays.
 */
 
 #include "S7Server.h"
@@ -87,9 +81,8 @@ static inline void wrW(uint8_t* p, uint16_t v)
 #define S7_ERR_NOT_IMPLEMENTED 0x8104
 
 // Per-ITEM result codes, carried inside the data section of a read or write
-// answer. Distinct from the header's error word: a request can succeed as a
-// request while one of its items fails, which is how a client asking for five
-// variables learns that the third does not exist without losing the other four.
+// answer. Distinct from the header's error word: a request can succeed while one
+// of its items fails.
 #define S7_ITEM_OK             0xFF
 #define S7_ITEM_OUT_OF_RANGE   0x05
 #define S7_ITEM_BAD_TRANSPORT  0x06
@@ -276,15 +269,10 @@ int S7Server::handle(S7SrvSession& session,
 }
 
 //-----------------------------------------------------------------------------
-// COTP Connection Request -> Connection Confirm.
-//
-// The confirm is the request echoed back with the PDU type changed and the
-// references swapped. That is what Snap7 does (IsoConfirmConnection) and it is
-// what the clients expect: the variable part carries the TSAPs and the TPDU
-// size the client proposed, and handing them straight back accepts them.
-//
-// Echoing also means we never have to parse the variable part, which is the
-// part whose length a malicious client controls.
+// COTP Connection Request -> Connection Confirm. The confirm is the request
+// echoed back with the PDU type changed and the references swapped, which
+// accepts the TSAPs and TPDU size the client proposed. Echoing also means we
+// never parse the variable part, whose length a malicious client controls.
 //-----------------------------------------------------------------------------
 int S7Server::cotpConnect(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                           uint8_t* resp, uint16_t respCap, uint16_t* respLen)
@@ -379,12 +367,10 @@ int S7Server::s7Dispatch(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 }
 
 //-----------------------------------------------------------------------------
-// Setup Communication.
-//
-// The client proposes a parallel-job count and a PDU size; the CPU answers
-// with what it will actually do. We accept the job counts as offered (we
-// serialise anyway, so promising fewer would only make clients pipeline less)
-// and clamp the PDU into what this build can buffer.
+// Setup Communication. The client proposes a parallel-job count and a PDU size;
+// we accept the job counts as offered (we serialise anyway) and clamp the PDU
+// into what this build can buffer.
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 int S7Server::funNegotiate(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                            uint8_t* resp, uint16_t respCap, uint16_t* respLen)
@@ -510,9 +496,9 @@ bool parseItem(const uint8_t* p, Item& out)
 //     [4..]  the data
 //     + one pad byte when the data length is odd AND this is not the last item
 //
-// The pad is not decoration. S7 never transfers an odd byte count between
-// items, and a client that does not find the next item where it expects it
-// reads the wrong variable rather than reporting an error.
+// S7 never transfers an odd byte count between items, and a client that does not
+// find the next item where it expects it reads the wrong variable.
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                       uint8_t* resp, uint16_t respCap, uint16_t* respLen)
@@ -524,15 +510,10 @@ int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
     const uint8_t* pdu    = req + S7ISO_HEADER_SIZE;
     const uint16_t parLen = rdW(pdu + 6);
 
-    // Too short to carry an item count. ANSWERED, not closed -- see the note on
+    // Too short to carry an item count. Answered, not closed -- see the note on
     // errorAnswer(): the frame parsed at every level we could resynchronise
-    // from, so the honest reply is "I cannot do that", and dropping the session
-    // would cost the client every other thing it was doing.
-    //
-    // Not hypothetical: python-snap7 3.1.2's get_cpu_state() sends exactly this
-    // -- a Read Var with a one-byte parameter section and no items -- and then
-    // ignores whatever comes back. Closing on it took down the connection and
-    // every subsequent call with it.
+    // from, and dropping the session would cost the client everything else it
+    // was doing. Some clients send exactly this and ignore the reply.
     if (parLen < 2)
         return errorAnswer(req, resp, respCap, respLen, S7_ERR_NOT_IMPLEMENTED);
 
@@ -691,24 +672,13 @@ int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
         if (rc == S7_ITEM_OK)
         {
             hdr[1] = resTs;
-            // BITS for Bit / Byte / Int, BYTES for Real and Octet.
-            // BITS for Byte and Int, BYTES for Real and Octet -- and for
-            // TS_RES_BIT the answer is 1 either way, since one bit is one bit
-            // and its payload is one byte.
+            // The length unit is bits for Byte and Int, bytes for Real and
+            // Octet. For TS_RES_BIT the answer is 1 either way.
             //
-            // Sending 1 here rather than 8 is deliberate. It is what Snap7's
-            // own server sends, what its C client expects, and what the
-            // Wireshark dissector documents. python-snap7 3.1.2's SINGLE-item
-            // read path divides every length by 8 unconditionally and so reads
-            // nothing from it -- but its MULTI-item path parses the same bytes
-            // correctly, which is the same library disagreeing with itself
-            // rather than a second convention.
-            //
-            // The asymmetry matters: sending 8 would make that one client
-            // work and would make Snap7's C client memcpy eight bytes into the
-            // one-byte buffer it allocated for a bit. A client that reads
-            // nothing has a bug; a client that overruns its buffer has a
-            // vulnerability, and we would have handed it one.
+            // Sending 1 rather than 8 is deliberate: it is what Snap7's own
+            // server sends and what the Wireshark dissector documents. Sending 8
+            // would make one client's single-item path work and would make
+            // Snap7's C client memcpy eight bytes into a one-byte buffer.
             wrW(hdr + 2, (resTs == TS_RES_BYTE || resTs == TS_RES_INT)
                              ? (uint16_t)(dataLen * 8)
                              : dataLen);
@@ -756,11 +726,10 @@ int S7Server::funRead(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 }
 
 //-----------------------------------------------------------------------------
-// Write Var
-//
-// The request carries the same 12-byte item specs in its parameter section,
-// and the values in its data section, each prefixed by the same 4-byte header
-// a read answer uses. The ANSWER is one byte per item.
+// Write Var. The request carries the same 12-byte item specs in its parameter
+// section and the values in its data section, each prefixed by the same 4-byte
+// header a read answer uses. The answer is one byte per item.
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                        uint8_t* resp, uint16_t respCap, uint16_t* respLen)
@@ -833,28 +802,14 @@ int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
         const uint16_t vLenRaw = rdW(vhdr + 2);
         const uint8_t* value   = vhdr + 4;
 
-        // How many bytes of payload this value actually occupies.
+        // How many bytes of payload this value actually occupies. The unit of
+        // the length field depends on the transport size -- bits for Byte and
+        // Int, bytes for Real and Octet.
         //
-        // The unit of the length field depends on the transport size -- BITS
-        // for Byte and Int, BYTES for Real and Octet -- and getting it
-        // backwards makes a value eight times too long or an eighth too short.
-        //
-        // TS_RES_BIT is the exception, and it is an exception because the
-        // clients disagree. A single bit is ALWAYS one byte on the wire (S7
-        // sends one byte per bit, and more than one bit per item is not a
-        // thing a CPU serves), so the length field adds nothing here -- and
-        // implementations fill it in differently:
-        //
-        //   Snap7 1.4.3 (C)      sends 1  -- the length in bits, which for one
-        //                                    bit is 1. Matches the Wireshark
-        //                                    dissector and real CPUs.
-        //   python-snap7 3.1.2   sends 8  -- its writer multiplies every
-        //                                    payload by 8 regardless of
-        //                                    transport size.
-        //
-        // Taking the payload as one byte and ignoring the declared length
-        // accepts both without guessing, and cannot be wrong: the spec already
-        // pinned the size at one bit.
+        // TS_RES_BIT is the exception, because implementations disagree about
+        // the declared length (some send 1, some send 8). A single bit is always
+        // one byte on the wire, so taking the payload as one byte and ignoring
+        // the declared length accepts both without guessing.
         uint16_t vBytes;
         if (vTs == TS_RES_BIT)
             vBytes = 1;
@@ -974,10 +929,8 @@ int S7Server::funWrite(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 }
 
 //-----------------------------------------------------------------------------
-// PLC Control — start and stop
-//
-// Answer shape is the smallest a type-3 AckData can be: the 12-byte header
-// plus a single parameter byte echoing the function.
+// PLC Control -- start and stop. Answer shape is the smallest a type-3 AckData
+// can be: the 12-byte header plus a single parameter byte echoing the function.
 //-----------------------------------------------------------------------------
 int S7Server::funControl(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
                          uint8_t* resp, uint16_t respCap, uint16_t* respLen,
@@ -1250,25 +1203,10 @@ int S7Server::userData(S7SrvSession& s, const uint8_t* req, uint16_t reqLen,
 }
 
 //-----------------------------------------------------------------------------
-// A well-formed AckData carrying nothing but an error.
-//
-// Worth doing properly: "not implemented" is a documented S7 answer, and a
-// client that receives it says so. Closing the connection instead produces a
-// timeout, which is the least informative failure there is and the one that
-// gets reported as "your device is broken".
-//
-// WHEN TO ANSWER AND WHEN TO CLOSE. The two failures are different and the
-// server treats them differently:
-//
-//   CLOSE   the byte stream can no longer be trusted -- a TPKT length that
-//           disagrees with what arrived, a COTP header longer than its frame,
-//           S7 parameter and data lengths that do not add up. There is no
-//           resynchronisation point in a TPKT stream, so continuing means
-//           parsing from an unknown offset.
-//
-//   ANSWER  the frame parsed at every level, and what it asks for is merely
-//           something this server will not do. Dropping the session there
-//           costs the client everything else it was doing, for no gain.
+// A well-formed AckData carrying nothing but an error. Close when the byte
+// stream can no longer be trusted, because a TPKT stream has no
+// resynchronisation point; answer when the frame parsed and merely asks for
+// something this server will not do.
 //-----------------------------------------------------------------------------
 int S7Server::errorAnswer(const uint8_t* req, uint8_t* resp, uint16_t respCap,
                           uint16_t* respLen, uint16_t errorCode)
