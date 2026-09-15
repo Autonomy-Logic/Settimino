@@ -857,10 +857,8 @@ static void test_understood_but_unservable_is_answered()
     ready(srv, s, resp, sizeof(resp));
 
     // A Read Var whose parameter section is one byte long and carries no items.
-    // python-snap7 3.1.2's get_cpu_state() sends exactly this and then ignores
-    // the answer. Closing on it took the session down and every later call with
-    // it; the frame parsed at every level we could resynchronise from, so the
-    // honest reply is "I cannot do that".
+    // Some clients send exactly this and ignore the answer, so closing on it
+    // would take the session down and every later call with it.
     uint8_t stub[] = {
         0x03, 0x00, 0x00, 0x12,
         0x02, 0xF0, 0x80,

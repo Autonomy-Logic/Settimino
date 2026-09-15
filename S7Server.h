@@ -19,79 +19,15 @@
 /*
   THE SERVER SIDE OF S7.
 
-  Settimino has always been a client: it dials a PLC and asks it questions.
-  This is the other half -- it answers them. An S7 server lets an HMI, a SCADA
-  system, TIA Portal or another PLC read and write this device's memory using
-  the protocol they already speak, with no gateway in between.
+  S7Server is a pure protocol engine: you hand it one complete ISO-TCP frame and
+  a buffer, and it hands you back the bytes to reply with. It owns no socket and
+  never reads, writes, waits, allocates or calls millis(), so the transport is
+  yours to choose and the engine runs on a PC under test.
 
-  ----------------------------------------------------------------------------
-  IT OWNS NO SOCKET. THAT IS THE WHOLE DESIGN.
-  ----------------------------------------------------------------------------
+  Areas are served from a flat buffer or through accessor callbacks, mixable area
+  by area. The area table is `const` so it can live in flash.
 
-  S7Client opens its own connection, blocks on recv, and retries on a timeout,
-  which is the right shape for a client: a sketch asks for a value and waits.
-
-  A server cannot work that way. It has to be reachable while the rest of the
-  program runs, and on the devices this library targets "the rest of the
-  program" may be a PLC scan cycle with a few hundred microseconds to spare. A
-  server that blocks on a peer is a server that lets a peer halt the machine.
-
-  So S7Server is a PURE PROTOCOL ENGINE. You hand it one complete ISO-TCP frame
-  and a buffer; it hands you back the bytes to reply with. It never reads, never
-  writes, never waits, never allocates, and never calls millis(). Where the
-  bytes came from is yours to decide -- EthernetServer, WiFiServer, lwIP raw,
-  a cooperative poll loop, or a unit test on a PC with no network at all.
-
-  This is also why the server is useful to a platform Settimino has never
-  supported: there is no transport to port.
-
-  ----------------------------------------------------------------------------
-  THE SHAPE OF A SESSION
-  ----------------------------------------------------------------------------
-
-    S7SrvSession s;
-    server.beginSession(s);                  // once per accepted connection
-
-    // when a complete frame has arrived:
-    uint16_t replyLen = 0;
-    int r = server.handle(s, frame, frameLen, reply, sizeof(reply), &replyLen);
-    if (replyLen) client.write(reply, replyLen);
-    if (r == S7SRV_CLOSE) client.stop();
-
-  S7IsoFrameLength() tells you when a frame is complete, so you can size the
-  read without guessing:
-
-    // buf holds `have` bytes so far
-    uint16_t need = S7IsoFrameLength(buf, have);
-    // 0  -> need at least 4 bytes before the length is knowable
-    // >0 -> the frame is `need` bytes long in total
-
-  ----------------------------------------------------------------------------
-  WHERE THE DATA COMES FROM
-  ----------------------------------------------------------------------------
-
-  Two ways, and they can be mixed area by area.
-
-  A FLAT BUFFER, like Snap7's Srv_RegisterArea:
-
-      static uint8_t db1[128];
-      static const S7SrvArea areas[] = {
-        { S7AreaDB, 1, db1, sizeof(db1) },
-      };
-      server.setAreas(areas, 1);
-
-  Or CALLBACKS, for a device whose values do not live in a buffer at all --
-  a PLC image assembled per scan, a sensor read on demand, a register file:
-
-      static const S7SrvArea areas[] = {
-        { S7AreaMK, 0, NULL, 256 },   // NULL data => ask the accessors
-      };
-      server.setAreas(areas, 1);
-      server.setAccessors(myRead, myWrite, &myContext);
-
-  The area table is `const` on purpose: it is fixed when the program is built
-  and never changes, so on a microcontroller it belongs in flash. Passing a
-  RAM array works and costs you the RAM.
+  See readme.md and examples/S7Server_Basic.
 */
 
 #ifndef S7SERVER_H
@@ -101,11 +37,8 @@
 #include <stddef.h>
 
 //-----------------------------------------------------------------------------
-// Area codes and word lengths.
-//
-// Guarded because Settimino.h defines the same constants for the client, and a
-// sketch may well include both -- the client to talk to a PLC, the server to be
-// talked to. They are protocol constants; there is only one correct value.
+// Area codes and word lengths. Guarded because Settimino.h defines the same
+// constants for the client, and a sketch may include both.
 //-----------------------------------------------------------------------------
 #ifndef S7AreaPE
 #define S7AreaPE    0x81  // Process inputs  (I)
@@ -184,16 +117,12 @@ typedef bool (*S7SrvWriteFn)(void* ctx, uint8_t area, uint16_t dbNumber,
 
 /** Write ONE bit, without disturbing the other seven in its byte.
  *
- *  S7 addresses bits as `byte.bit`, and a callback-backed area may have real
- *  hardware behind each bit -- eight relay outputs in a byte, say. Serving a
- *  bit write by reading the byte, changing a bit and writing it back would
- *  re-assert the other seven, which is a different thing from leaving them
- *  alone and is visible on the wire if two clients write neighbouring bits.
+ *  A callback-backed area may have real hardware behind each bit, so serving a
+ *  bit write by read-modify-write of the byte would re-assert the other seven.
  *
  *  Optional. An area served by callbacks with no bit writer refuses bit writes
- *  with "access denied" rather than guessing -- refusing is recoverable, a
- *  clobbered output is not. Flat-buffer areas never need this: the buffer is
- *  the only owner of those bits, so the server updates them in place. */
+ *  with "access denied" rather than guessing. Flat-buffer areas never need this:
+ *  the buffer is the only owner of those bits. */
 typedef bool (*S7SrvWriteBitFn)(void* ctx, uint8_t area, uint16_t dbNumber,
                                 uint32_t byteIndex, uint8_t bitIndex, bool value);
 
@@ -211,13 +140,9 @@ struct S7SrvArea
     /** Refuse every write to this area, whatever the server-wide setting.
      *
      *  Expressed as readOnly rather than writable so that leaving it out of an
-     *  aggregate initialiser -- `{ S7AreaDB, 1, db1, sizeof(db1) }`, which is
-     *  what every existing caller writes -- zero-initialises to the permissive
-     *  value and keeps meaning what it already meant.
-     *
-     *  The natural use is the process-INPUT area: it is what the field wires
-     *  drive, so a client writing it is writing a value the next input refresh
-     *  overwrites, which looks like the write was silently lost. */
+     *  aggregate initialiser zero-initialises to the permissive value and keeps
+     *  meaning what it already meant. The natural use is the process-input area,
+     *  which the field wires drive. */
     bool      readOnly;
 };
 
@@ -228,19 +153,13 @@ struct S7SrvArea
 /**
  * What the CPU says it is when a client asks.
  *
- * Many clients query the System Status List to identify a CPU BEFORE doing
- * anything useful -- python-snap7's read/write path never does, TIA Portal and
- * several HMIs do, and some refuse to talk to a device that will not answer.
- * So this is not decoration: for those clients it is the difference between a
- * device that works and one that appears broken.
+ * Many clients query the System Status List to identify a CPU before doing
+ * anything useful, and some refuse to talk to a device that will not answer.
  *
  * Every field is a `const char*` that must outlive the server; string literals
- * or PROGMEM-adjacent flash data are the intended use. NULL fields are sent as
- * empty, which is what a real CPU does for a designation nobody set.
+ * or flash data are the intended use. NULL fields are sent as empty.
  *
- * The record numbers are SZL 0x001C's, and they are what a client displays --
- * `moduleName` is the "CPU type" an HMI shows, `serialNumber` the one an asset
- * register records.
+ * The record numbers are SZL 0x001C's, and they are what a client displays.
  */
 struct S7SrvIdentity
 {
